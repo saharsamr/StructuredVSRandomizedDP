@@ -1,0 +1,13 @@
+# Auxillary Python files
+dpgrape/dpgrape.egg-info/
+dpgrape/dpgrape/dpgrape.egg-info/
+dpgrape/build/
+
+# Output logs
+vit_pretraining/output*
+roberta_finetuning/output*
+opt_finetuning/output*
+
+# Other files
+roberta_finetuning/datasets/roberta/k-shot-1k-test/SST-2/512-42/cached_dev_RobertaTokenizerFast-roberta_128_sst-2.lock
+roberta_finetuning/log.lock
