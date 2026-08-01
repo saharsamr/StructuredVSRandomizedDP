@@ -52,6 +52,7 @@ from torch.optim import SGD
 import torch.nn.functional as F
 
 from .linearhead_trainer import LinearHeadTrainer
+from . import wandb_utils
 from transformers.trainer_callback import TrainerState
 
 import copy
@@ -436,6 +437,14 @@ class Trainer(LinearHeadTrainer):
         logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
         logger.info("  Total optimization steps = %d", t_total)
 
+        wandb_utils.update_config({
+            "num_train_examples": self.num_examples(train_dataloader),
+            "num_train_epochs": num_train_epochs,
+            "total_train_batch_size": total_train_batch_size,
+            "total_optimization_steps": t_total,
+            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        })
+
         self.state = TrainerState()
         self.state.global_step = 0
         start_time = time.time()
@@ -486,6 +495,14 @@ class Trainer(LinearHeadTrainer):
                                               )
             print("NOISE MULTIPLIER: ", multiplier)
             self.dpzero_gaussian_std = 2 * multiplier * self.args.dp_clip_threshold / total_train_batch_size
+
+            # The accountant's calibration is the thing you most often need to check after
+            # the fact, so it goes in the run config rather than only stdout.
+            wandb_utils.update_config({
+                "noise_multiplier": multiplier,
+                "sample_rate": sample_rate,
+                "dpzero_gaussian_std": self.dpzero_gaussian_std,
+            })
 
         # DP-Grape / DP-GaLore / DPTrack-Oracle - use opacus
         if self.uses_projected_dp:
@@ -740,7 +757,8 @@ class Trainer(LinearHeadTrainer):
                                 logs["time"] = time.time() - start_time
                                 self.log(logs)
                                 logger.info(str(logs))
-                            
+                                wandb_utils.log(logs, step=self.state.global_step, prefix="train")
+
                             model.zero_grad()
                             self.state.global_step += 1
                             self.epoch = epoch + (step + 1) / len(epoch_iterator)
@@ -779,6 +797,7 @@ class Trainer(LinearHeadTrainer):
                                 logs["max_memory_reserved"] = torch.cuda.max_memory_reserved()
                                 self.log(logs)
                                 logger.info(str(logs))
+                                wandb_utils.log(logs, step=self.state.global_step, prefix="train")
 
 
                         self.state.global_step += 1
@@ -852,6 +871,7 @@ class Trainer(LinearHeadTrainer):
 
                             self.log(logs)
                             logger.info(str(logs))
+                            wandb_utils.log(logs, step=self.state.global_step, prefix="train")
                     
                     elif self.uses_projected_dp or self.args.dpadam:
                         optimizer.signal_skip_step()
@@ -869,11 +889,14 @@ class Trainer(LinearHeadTrainer):
                     logs["global_step"] = self.state.global_step
                     logs["eval"] = eval_metrics
                     logger.info(str(logs))
+                    wandb_utils.log(eval_metrics.metrics, step=self.state.global_step, prefix="eval")
 
                 if self.args.evaluate_during_training and self.state.global_step % self.args.eval_steps == 0:
                     output = self.evaluate()
                     metrics = output.metrics
                     objective = self.dev_objective(metrics)
+                    wandb_utils.log({"dev_objective": objective, "best_dev_objective": max(objective, self.objective)},
+                                    step=self.state.global_step, prefix="eval")
                     if objective > self.objective:
                         logger.info("Best dev result: {}".format(objective))
                         self.objective = objective
@@ -895,6 +918,18 @@ class Trainer(LinearHeadTrainer):
             delattr(self, "_past")
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
+
+        train_summary = {
+            "train/total_time": time.time() - start_time,
+            "train/global_step": self.state.global_step,
+            "train/zo_forward_step": self.state.zo_forward_step,
+            "train/max_memory_allocated": torch.cuda.max_memory_allocated(),
+            "train/max_memory_reserved": torch.cuda.max_memory_reserved(),
+        }
+        if math.isfinite(self.objective):  # -inf whenever --evaluate_during_training is off
+            train_summary["eval/best_dev_objective"] = self.objective
+        wandb_utils.set_summary(train_summary)
+
         return TrainOutput(self.state.global_step, tr_loss / self.state.global_step, metrics), self.objective
 
 
@@ -951,14 +986,18 @@ class Trainer(LinearHeadTrainer):
             proj.last_ortho_err for _, proj in iter_low_rank_projectors(optimizer)
             if proj.last_ortho_err is not None
         ]
-        logger.info(str({
+        diagnostics = {
             "subspace_update_at_step": self.state.global_step,
             "method": self.low_rank_method,
             "oracle_batch_mode": self.args.oracle_batch_mode,
             "subspace_batches_consumed": self.subspace_batches_consumed,
             "mean_rotation_deg": float(np.mean(rotations)) if rotations else None,
             "max_ortho_err": float(np.max(ortho_errs)) if ortho_errs else None,
-        }))
+        }
+        logger.info(str(diagnostics))
+        # mean_rotation_deg is the number to watch for dptrack (see roberta_finetuning_dptrack.sh):
+        # near 0 means the tracker is a no-op, huge means it is thrashing.
+        wandb_utils.log(diagnostics, step=self.state.global_step, prefix="subspace")
 
     def training_step(
         self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None

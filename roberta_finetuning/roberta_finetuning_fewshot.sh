@@ -72,6 +72,30 @@ case $TASK in
         ;;
 esac
 
+# Weights & Biases, on unless USE_WANDB=false is in the environment. The calling scripts each
+# pass --use_wandb $USE_WANDB themselves (they read the same variable, and $@ comes last
+# below, so the two always agree); what is added here is the rest of the W&B settings, which
+# every script would otherwise repeat. The run name defaults to $GRID_TAG, which already
+# encodes the full hyperparameter setting, so runs line up with the .txt log files on disk.
+#   TASK=SST-2 bash roberta_finetuning_dpgrape.sh
+#   WANDB_PROJECT=... WANDB_ENTITY=... WANDB_GROUP=c-search WANDB_MODE=offline ...
+#   USE_WANDB=false TASK=SST-2 bash roberta_finetuning_dpgrape.sh   # opt out
+WANDB_ARGS=""
+if [ "${USE_WANDB:-true}" = "true" ]; then
+    WANDB_ARGS="--use_wandb True"  # for anyone invoking this script directly
+    WANDB_ARGS="$WANDB_ARGS --wandb_project ${WANDB_PROJECT:-structured-vs-randomized-dp}"
+    # Each flag is added only when it has a value: an empty one would swallow the next flag,
+    # since ALL_ARGS_TOGETHER is expanded unquoted. Empty ones fall back to the defaults in
+    # roberta_finetuning_run.py (the run name is derived from --log_file there).
+    RUN_NAME=${WANDB_RUN_NAME:-${GRID_TAG:-$TAG}}
+    [ -n "$RUN_NAME" ] && WANDB_ARGS="$WANDB_ARGS --wandb_run_name $RUN_NAME"
+    [ -n "$WANDB_ENTITY" ] && WANDB_ARGS="$WANDB_ARGS --wandb_entity $WANDB_ENTITY"
+    [ -n "$WANDB_GROUP" ] && WANDB_ARGS="$WANDB_ARGS --wandb_group $WANDB_GROUP"
+    [ -n "$WANDB_TAGS" ] && WANDB_ARGS="$WANDB_ARGS --wandb_tags $WANDB_TAGS"
+    [ -n "$WANDB_MODE" ] && WANDB_ARGS="$WANDB_ARGS --wandb_mode $WANDB_MODE"
+    [ -n "$WANDB_DIR" ] && WANDB_ARGS="$WANDB_ARGS --wandb_dir $WANDB_DIR"
+fi
+
 ALL_ARGS_TOGETHER="
     --model_name_or_path $MODEL --few_shot_type $TYPE
     --task_name $TASK --template $TEMPLATE --mapping $MAPPING
@@ -90,6 +114,7 @@ ALL_ARGS_TOGETHER="
     --tie_emb True
     $TASK_EXTRA
     $LOAD_KERNELS
+    $WANDB_ARGS
     $@
 "
 

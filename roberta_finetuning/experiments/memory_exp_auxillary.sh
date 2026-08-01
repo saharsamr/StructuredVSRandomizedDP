@@ -24,6 +24,10 @@ WD=${WD:-0}
 STEP=${STEP:-30}
 EVAL_STEP=${EVAL_STEP:-10000}
 MODEL=${MODEL:-roberta-large}
+
+# Logs and results also stream to Weights & Biases; set USE_WANDB=false to turn that off (see README).
+USE_WANDB=${USE_WANDB:-true}
+
 PRIVACY_EPS=${PRIVACY_EPS:-6.0}
 PRIVACY_DELTA=${PRIVACY_DELTA:-1e-5}
 
@@ -67,6 +71,7 @@ do
             --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
             --subspace_r $SUBSPACE_R \
             --subspace_T $SUBSPACE_T \
+            --use_wandb $USE_WANDB \
             --report_to none \
             --log_file $OUT_FILE 
     done

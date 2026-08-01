@@ -32,6 +32,9 @@ STEP=${STEP:-1000}
 EVAL_STEP=${EVAL_STEP:-10000}
 MODEL=${MODEL:-roberta-large}
 
+# Logs and results also stream to Weights & Biases; set USE_WANDB=false to turn that off (see README).
+USE_WANDB=${USE_WANDB:-true}
+
 # Flat clipping threshold, tuned per task by the DP-GRAPE paper (App. C.2). Keep this block
 # identical across roberta_finetuning_dp{grape,galore,track}.sh -- C must be the same for all
 # three methods or the comparison is not controlled.
@@ -102,6 +105,7 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --subspace_r $SUBSPACE_R \
     --subspace_T $SUBSPACE_T \
+    --use_wandb $USE_WANDB \
     --report_to none \
     --log_file $OUT_FILE \
     --no_train False
