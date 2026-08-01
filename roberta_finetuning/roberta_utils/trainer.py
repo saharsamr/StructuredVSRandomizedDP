@@ -384,10 +384,18 @@ class Trainer(LinearHeadTrainer):
             and os.path.isfile(os.path.join(model_path, "scheduler.pt"))
         ):
             # Load in optimizer and scheduler states
+            # weights_only=False: these are locally-written trainer states that contain
+            # plain Python objects; torch>=2.6 defaults to True and would reject them.
             optimizer.load_state_dict(
-                torch.load(os.path.join(model_path, "optimizer.pt"), map_location=self.args.device)
+                torch.load(
+                    os.path.join(model_path, "optimizer.pt"),
+                    map_location=self.args.device,
+                    weights_only=False,
+                )
             )
-            scheduler.load_state_dict(torch.load(os.path.join(model_path, "scheduler.pt")))
+            scheduler.load_state_dict(
+                torch.load(os.path.join(model_path, "scheduler.pt"), weights_only=False)
+            )
 
         model = self.model
 

@@ -352,7 +352,11 @@ class FewShotDataset(torch.utils.data.Dataset):
 
             if os.path.exists(cached_features_file) and not args.overwrite_cache:
                 start = time.time()
-                self.support_examples, self.query_examples = torch.load(cached_features_file)
+                # weights_only=False: the cache holds pickled InputExample objects, not tensors.
+                # torch>=2.6 defaults this to True, which refuses to unpickle them.
+                self.support_examples, self.query_examples = torch.load(
+                    cached_features_file, weights_only=False
+                )
                 logger.info(
                     f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
                 )

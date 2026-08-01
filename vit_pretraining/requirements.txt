@@ -1,3 +1,11 @@
+# Install with:  pip install -r requirements.txt
+#
+# PyTorch must be the cu128 build. The default PyPI wheel compiles kernels only
+# up to sm_90, so on Blackwell GPUs (sm_120, e.g. RTX PRO 6000) every CUDA op
+# dies with "CUDA error: no kernel image is available for execution on the
+# device". The cu128 build covers sm_75 through sm_120.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 alembic>=1.5.0
 click!=8.0.0,>=7.1
 datasets>=2.0.0
@@ -6,8 +14,8 @@ numpy<2.0
 opacus==1.4.0
 pandas
 timm==1.0.12
-torch==2.5.1
-torchvision==0.20.1
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
 tqdm==4.67.1
 pyparsing>=2.3.1
 sqlalchemy>=1.4.2
