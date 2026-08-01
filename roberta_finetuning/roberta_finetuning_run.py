@@ -520,6 +520,34 @@ class DynamicTrainingArguments(TrainingArguments):
         }
     )
 
+    # Data-driven subspace args (DP-GaLore / DPTrack-Oracle).
+    # WARNING: both estimate the subspace from BARE batch gradients, so the method as a
+    # whole is eps = infinity. Only the weight updates are DP. See DPTRACK_DESIGN.md.
+    dpgalore: bool = field(
+        default=False,
+        metadata={
+            "help": "DP-GaLore: subspace = SVD of the bare batch gradient every subspace_T steps"}
+    )
+    dptrack: bool = field(
+        default=False,
+        metadata={
+            "help": "DPTrack-Oracle: subspace = rank-1 SubTrack++ geodesic step on the bare batch gradient"}
+    )
+    oracle_batch_mode: str = field(
+        default='shared',
+        metadata={
+            "help": "'shared' reuses the training batch for the bare backward; "
+                    "'skip' uses the held-out dev split and takes no weight update on it"}
+    )
+    st_step_size: float = field(
+        default=10.0,
+        metadata={"help": "SubTrack++ geodesic step size (dptrack only)"}
+    )
+    st_step_size_scheduler: str = field(
+        default='constant',
+        metadata={"help": "'constant' or 'iterative_decrease' (dptrack only)"}
+    )
+
 @dataclass
 class MyDataCollatorWithPadding:
     """
@@ -622,6 +650,12 @@ def main():
 
     if training_args.optimizer_variant != '':
         assert training_args.optimizer == 'sgd', 'variants on optimizer are only implemented for SGD'
+
+    if sum([training_args.dpgrape, training_args.dpgalore, training_args.dptrack]) > 1:
+        raise ValueError('pick at most one of --dpgrape / --dpgalore / --dptrack')
+
+    if training_args.oracle_batch_mode not in ('shared', 'skip'):
+        raise ValueError("--oracle_batch_mode must be 'shared' or 'skip'")
 
     if 'prompt' in model_args.few_shot_type:
         data_args.prompt = True

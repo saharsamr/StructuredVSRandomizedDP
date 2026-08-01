@@ -11,3 +11,5 @@ opt_finetuning/output*
 # Other files
 roberta_finetuning/datasets/roberta/k-shot-1k-test/SST-2/512-42/cached_dev_RobertaTokenizerFast-roberta_128_sst-2.lock
 roberta_finetuning/log.lock
+.idea*
+*.pdf

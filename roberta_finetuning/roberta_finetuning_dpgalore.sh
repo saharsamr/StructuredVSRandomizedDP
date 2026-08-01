@@ -1,12 +1,16 @@
 #!/bin/bash
 #
-# DP-GRAPE (seeded random Gaussian subspace) on RoBERTa-Large, few-shot. The DP baseline:
-# this one really is eps-DP at the stated epsilon, unlike its two siblings
-# roberta_finetuning_dpgalore.sh and roberta_finetuning_dptrack.sh.
+# DP-GaLore (bare-gradient SVD subspace) on RoBERTa-Large, few-shot.
 #
-# Fine-tunes and evaluates in one invocation.
+# WARNING: the subspace is the top-r SVD of the BARE (unclipped, unnoised) batch gradient,
+# recomputed every SUBSPACE_T steps. The weight updates are DP; the subspace is not, so
+# this method is eps = infinity as a whole. Do not put its numbers in the same column as
+# DP-GRAPE without saying so. See DPTRACK_DESIGN.md section 4.
 #
-# Usage:  TASK=SST-2 SEED=42 C=0.5 PRIVACY_EPS=6.0 bash roberta_finetuning_dpgrape.sh
+# Fine-tunes and evaluates in one invocation: roberta_finetuning_fewshot.sh passes
+# --do_train --do_eval --do_predict, so dev and test metrics land in the log file.
+#
+# Usage:  TASK=SST-2 SEED=42 C=0.5 PRIVACY_EPS=6.0 bash roberta_finetuning_dpgalore.sh
 
 TASK=${TASK:-SST-2}
 K=${K:-512}
@@ -41,6 +45,7 @@ PRIVACY_DELTA=${PRIVACY_DELTA:-1e-5}
 
 SUBSPACE_R=${SUBSPACE_R:-16}
 SUBSPACE_T=${SUBSPACE_T:-100}
+ORACLE_BATCH_MODE=${ORACLE_BATCH_MODE:-shared}
 
 if [ "$TASK" = "SNLI" ]; then
     LOGITS=3
@@ -57,13 +62,13 @@ fi
 NUM_GPU=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 BS=$((PER_DEVICE_TRAIN_BS * GRAD_ACCUM_STEPS * NUM_GPU))
 
-GR_TAG=dpgrape-$TASK-seed$SEED-bs$BS-lr$LR-dpeps$PRIVACY_EPS-dpdelta$PRIVACY_DELTA-dpC$C-totalsteps$STEP-evalstep$EVAL_STEP-subspace_r$SUBSPACE_R-subspace_T$SUBSPACE_T
+GR_TAG=dpgalore-$TASK-seed$SEED-bs$BS-lr$LR-dpeps$PRIVACY_EPS-dpdelta$PRIVACY_DELTA-dpC$C-totalsteps$STEP-evalstep$EVAL_STEP-subspace_r$SUBSPACE_R-subspace_T$SUBSPACE_T-batchmode$ORACLE_BATCH_MODE
 
 mkdir -p output_logs
 OUT_FILE="output_logs/${GR_TAG}.txt"
 
 EXTRA_TAG=${EXTRA_TAG:-ft-}
-TAG=${TAG:-k${K}-${MODEL}-dpgrape-${EXTRA_TAG}}
+TAG=${TAG:-k${K}-${MODEL}-dpgalore-${EXTRA_TAG}}
 echo "Grid search tag: $GR_TAG"
 echo "Tag: $TAG"
 
@@ -79,7 +84,8 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --dp_epsilon $PRIVACY_EPS \
     --dp_delta $PRIVACY_DELTA \
     --dp_clip_strategy flat \
-    --dpgrape True \
+    --dpgalore True \
+    --oracle_batch_mode $ORACLE_BATCH_MODE \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --subspace_r $SUBSPACE_R \
     --subspace_T $SUBSPACE_T \

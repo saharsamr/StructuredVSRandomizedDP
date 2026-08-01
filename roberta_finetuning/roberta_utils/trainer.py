@@ -62,6 +62,10 @@ from opacus import PrivacyEngine
 
 from dpgrape.dpadamw import DPAdamW as DPGrapeAdamW
 from dpgrape.privacy.privacy_engine_modified import PrivacyEngineModified
+from dpgrape.low_rank_projector_dp import (
+    attach_low_rank_projectors,
+    iter_low_rank_projectors,
+)
 
 from opacus.utils.module_utils import has_trainable_params
 
@@ -159,6 +163,24 @@ class Trainer(LinearHeadTrainer):
     Adding some functions based on Transformers' Trainer class.
     """
 
+    @property
+    def low_rank_method(self):
+        """'galore', 'subtrack', or None -- which data-driven subspace to track.
+
+        Both are eps = infinity as a whole: the subspace comes from bare (unclipped,
+        unnoised) batch gradients. Only the weight updates are DP. See DPTRACK_DESIGN.md.
+        """
+        if getattr(self.args, "dpgalore", False):
+            return "galore"
+        if getattr(self.args, "dptrack", False):
+            return "subtrack"
+        return None
+
+    @property
+    def uses_projected_dp(self):
+        """True for every method that runs the projected opacus pipeline."""
+        return self.args.dpgrape or self.low_rank_method is not None
+
     def create_optimizer_and_scheduler(self, num_training_steps: int):
         """
         Based on Transformers' default one, we add fixing layer option where the bottom n layers' parameters
@@ -210,7 +232,7 @@ class Trainer(LinearHeadTrainer):
                     "weight_decay": 0.0,
                 },
             ]
-            if self.args.dpgrape:
+            if self.uses_projected_dp:
                 galore_params = []
                 target_modules = ["attn", "attention", "dense", "mlp"]
                 skip_modules = ["lm_head"]
@@ -377,7 +399,7 @@ class Trainer(LinearHeadTrainer):
 
         # Multi-gpu training (should be after apex fp16 initialization)
         if "LOCAL_RANK" in os.environ:
-            if self.args.dpgrape or self.args.dpadam:
+            if self.uses_projected_dp or self.args.dpadam:
                 model = DPDDP(model)
             else:
                 model = torch.nn.parallel.DistributedDataParallel(
@@ -449,7 +471,7 @@ class Trainer(LinearHeadTrainer):
         metrics = None
 
         # set up dp parameters:
-        if self.args.dpzero or self.args.dpgrape or self.args.dpadam:
+        if self.args.dpzero or self.uses_projected_dp or self.args.dpadam:
             if "LOCAL_RANK" in os.environ:
                 k = model.module.num_k
                 num_labels = model.module.num_labels
@@ -465,8 +487,8 @@ class Trainer(LinearHeadTrainer):
             print("NOISE MULTIPLIER: ", multiplier)
             self.dpzero_gaussian_std = 2 * multiplier * self.args.dp_clip_threshold / total_train_batch_size
 
-        # DP-Grape - use opacus
-        if self.args.dpgrape:
+        # DP-Grape / DP-GaLore / DPTrack-Oracle - use opacus
+        if self.uses_projected_dp:
             privacy_engine = PrivacyEngineModified()
             model.train()  # Required for opacus
 
@@ -497,10 +519,44 @@ class Trainer(LinearHeadTrainer):
                         random_proj=True,
                         grad_sample_mode="projected",
                     )
-            optimizer.update_projectors('gaussian')
-            model.update_projectors(optimizer)
-            model.remove_hooks(keep_ddp_hooks=True)
-            model.add_hooks()
+            if self.low_rank_method is None:
+                optimizer.update_projectors('gaussian')
+                model.update_projectors(optimizer)
+                model.remove_hooks(keep_ddp_hooks=True)
+                model.add_hooks()
+            else:
+                logger.warning(
+                    "*** %s: the subspace is estimated from BARE batch gradients. "
+                    "The weight updates are DP but the subspace is not, so the method as "
+                    "a whole is eps = infinity. Report it separately from DP-GRAPE. ***",
+                    'DP-GaLore' if self.low_rank_method == 'galore' else 'DPTrack-Oracle',
+                )
+                attach_low_rank_projectors(
+                    optimizer,
+                    model,
+                    method=self.low_rank_method,
+                    subspace_update_interval=self.args.subspace_T,
+                    st_step_size=self.args.st_step_size,
+                    st_step_size_scheduler=(
+                        self.args.st_step_size_scheduler
+                        if self.args.st_step_size_scheduler != 'constant' else None
+                    ),
+                )
+                # Batch used for the bare backward at subspace update steps.
+                if self.args.oracle_batch_mode == 'skip':
+                    # Held-out dev split: disjoint from train.tsv and from test.tsv by construction.
+                    assert self.eval_dataset is not None, '--oracle_batch_mode skip requires --do_eval'
+                    self.subspace_dataloader = DataLoader(
+                        self.eval_dataset,
+                        batch_size=self.args.train_batch_size,
+                        sampler=RandomSampler(self.eval_dataset),
+                        collate_fn=self.data_collator,
+                        drop_last=True,
+                    )
+                else:
+                    self.subspace_dataloader = train_dataloader
+                self.subspace_iter = None
+                self.subspace_batches_consumed = 0
 
         elif self.args.dpadam:
             privacy_engine = PrivacyEngine()
@@ -556,6 +612,9 @@ class Trainer(LinearHeadTrainer):
                 if self.args.dpgrape and self.state.global_step % self.args.subspace_T == 0 and self.state.global_step != last_global_step:
                     optimizer.update_projectors('gaussian')
                     optimizer.zero_grad()
+
+                if self.low_rank_method is not None and self.state.global_step % self.args.subspace_T == 0 and self.state.global_step != last_global_step:
+                    self.update_low_rank_subspaces(model, optimizer, inputs)
 
                 if self.args.sync_embedding_layers:
                     assert model.module.model_type == 'opt', 'did not implement embedding layer synchronization for non-OPT models'
@@ -736,7 +795,7 @@ class Trainer(LinearHeadTrainer):
                         len(epoch_iterator) <= self.args.gradient_accumulation_steps
                         and (step + 1) == len(epoch_iterator)
                     ):
-                        if not self.args.dpgrape and not self.args.dpadam: # dpgrape/dpadam do their own clipping
+                        if not self.uses_projected_dp and not self.args.dpadam: # dpgrape/dpadam do their own clipping
                             if self.args.fp16 and _use_native_amp:
                                 self.scaler.unscale_(optimizer)
                                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
@@ -761,7 +820,7 @@ class Trainer(LinearHeadTrainer):
 
                         scheduler.step()
 
-                        if self.args.dpgrape or self.args.dpadam:
+                        if self.uses_projected_dp or self.args.dpadam:
                             optimizer.zero_grad()
                         else:
                             model.zero_grad()
@@ -794,7 +853,7 @@ class Trainer(LinearHeadTrainer):
                             self.log(logs)
                             logger.info(str(logs))
                     
-                    elif self.args.dpgrape or self.args.dpadam:
+                    elif self.uses_projected_dp or self.args.dpadam:
                         optimizer.signal_skip_step()
                         optimizer.step()
                         optimizer.zero_grad()
@@ -838,6 +897,68 @@ class Trainer(LinearHeadTrainer):
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(self.state.global_step, tr_loss / self.state.global_step, metrics), self.objective
 
+
+    def next_subspace_batch(self):
+        """Draw a batch from a dedicated iterator, for --oracle_batch_mode skip."""
+        if self.subspace_iter is None:
+            self.subspace_iter = iter(self.subspace_dataloader)
+        try:
+            return next(self.subspace_iter)
+        except StopIteration:
+            self.subspace_iter = iter(self.subspace_dataloader)
+            return next(self.subspace_iter)
+
+    def update_low_rank_subspaces(self, model, optimizer, inputs):
+        """One ordinary backward pass, then advance every layer's subspace with it.
+
+        This is the non-private half of DP-GaLore / DPTrack-Oracle. Hooks are disabled so
+        opacus does not build per-sample gradients: ``p.grad`` is then the plain batch mean
+        Gbar_raw. Nothing here touches the accountant -- no clipping, no noise, no step.
+
+        oracle_batch_mode:
+          shared  reuse this step's training batch (one extra backward, no data wasted)
+          skip    draw a batch from the held-out dev split, no weight update
+        """
+        skip_mode = self.args.oracle_batch_mode == 'skip'
+        batch = self.next_subspace_batch() if skip_mode else inputs
+
+        model.train()   # self.evaluate() may have left the model in eval mode
+        optimizer.zero_grad()
+        model.disable_hooks()
+        try:
+            batch = self._prepare_inputs(batch)
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, batch)
+            if self.args.n_gpu > 1:
+                loss = loss.mean()
+            loss.backward()
+
+            with torch.no_grad():
+                for p, projector in iter_low_rank_projectors(optimizer):
+                    if p.grad is None:
+                        continue
+                    projector.update_subspace(p.grad.detach().float(), self.state.global_step)
+        finally:
+            optimizer.zero_grad()
+            model.enable_hooks()
+
+        self.subspace_batches_consumed += 1
+        rotations = [
+            proj.last_rotation_deg for _, proj in iter_low_rank_projectors(optimizer)
+            if proj.last_rotation_deg is not None
+        ]
+        ortho_errs = [
+            proj.last_ortho_err for _, proj in iter_low_rank_projectors(optimizer)
+            if proj.last_ortho_err is not None
+        ]
+        logger.info(str({
+            "subspace_update_at_step": self.state.global_step,
+            "method": self.low_rank_method,
+            "oracle_batch_mode": self.args.oracle_batch_mode,
+            "subspace_batches_consumed": self.subspace_batches_consumed,
+            "mean_rotation_deg": float(np.mean(rotations)) if rotations else None,
+            "max_ortho_err": float(np.max(ortho_errs)) if ortho_errs else None,
+        }))
 
     def training_step(
         self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None

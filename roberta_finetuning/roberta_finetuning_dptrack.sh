@@ -1,12 +1,25 @@
 #!/bin/bash
 #
-# DP-GRAPE (seeded random Gaussian subspace) on RoBERTa-Large, few-shot. The DP baseline:
-# this one really is eps-DP at the stated epsilon, unlike its two siblings
-# roberta_finetuning_dpgalore.sh and roberta_finetuning_dptrack.sh.
+# DPTrack-Oracle (bare-gradient SubTrack++ subspace) on RoBERTa-Large, few-shot.
 #
-# Fine-tunes and evaluates in one invocation.
+# WARNING: the subspace is initialized by SVD of the BARE (unclipped, unnoised) batch
+# gradient and then advanced by one rank-1 geodesic step per SUBSPACE_T steps, again on a
+# bare batch gradient. The weight updates are DP; the subspace is not, so this method is
+# eps = infinity as a whole. Do not put its numbers in the same column as DP-GRAPE without
+# saying so. See DPTRACK_DESIGN.md section 4.
 #
-# Usage:  TASK=SST-2 SEED=42 C=0.5 PRIVACY_EPS=6.0 bash roberta_finetuning_dpgrape.sh
+# Everything except the projector is identical to DP-GRAPE and DP-GaLore: same flat
+# clipping, same noise, same accountant, same DPAdamW, same rank and update period.
+#
+# ST_STEP_SIZE is an uncalibrated starting guess, not a tuned value. The rotation per update
+# is exactly ST_STEP_SIZE * Sigma radians, where Sigma is the top singular value of the
+# tangent vector -- quadratic in the gradient scale, so it varies by orders of magnitude
+# across layers and shrinks as training converges. Check mean_rotation_deg in the log before
+# trusting any result (near 0 means the tracker is a no-op; a huge value means it is
+# thrashing). Target ~90 * SUBSPACE_T / STEP degrees per update, i.e. ~10 deg at the
+# defaults below; rescale linearly, since ST_STEP_SIZE and the angle are proportional.
+#
+# Usage:  TASK=SST-2 SEED=42 C=0.5 PRIVACY_EPS=6.0 bash roberta_finetuning_dptrack.sh
 
 TASK=${TASK:-SST-2}
 K=${K:-512}
@@ -41,6 +54,9 @@ PRIVACY_DELTA=${PRIVACY_DELTA:-1e-5}
 
 SUBSPACE_R=${SUBSPACE_R:-16}
 SUBSPACE_T=${SUBSPACE_T:-100}
+ORACLE_BATCH_MODE=${ORACLE_BATCH_MODE:-shared}
+ST_STEP_SIZE=${ST_STEP_SIZE:-10}
+ST_STEP_SIZE_SCHEDULER=${ST_STEP_SIZE_SCHEDULER:-constant}
 
 if [ "$TASK" = "SNLI" ]; then
     LOGITS=3
@@ -57,13 +73,13 @@ fi
 NUM_GPU=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 BS=$((PER_DEVICE_TRAIN_BS * GRAD_ACCUM_STEPS * NUM_GPU))
 
-GR_TAG=dpgrape-$TASK-seed$SEED-bs$BS-lr$LR-dpeps$PRIVACY_EPS-dpdelta$PRIVACY_DELTA-dpC$C-totalsteps$STEP-evalstep$EVAL_STEP-subspace_r$SUBSPACE_R-subspace_T$SUBSPACE_T
+GR_TAG=dptrack-$TASK-seed$SEED-bs$BS-lr$LR-dpeps$PRIVACY_EPS-dpdelta$PRIVACY_DELTA-dpC$C-totalsteps$STEP-evalstep$EVAL_STEP-subspace_r$SUBSPACE_R-subspace_T$SUBSPACE_T-batchmode$ORACLE_BATCH_MODE-ststep$ST_STEP_SIZE
 
 mkdir -p output_logs
 OUT_FILE="output_logs/${GR_TAG}.txt"
 
 EXTRA_TAG=${EXTRA_TAG:-ft-}
-TAG=${TAG:-k${K}-${MODEL}-dpgrape-${EXTRA_TAG}}
+TAG=${TAG:-k${K}-${MODEL}-dptrack-${EXTRA_TAG}}
 echo "Grid search tag: $GR_TAG"
 echo "Tag: $TAG"
 
@@ -79,7 +95,10 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --dp_epsilon $PRIVACY_EPS \
     --dp_delta $PRIVACY_DELTA \
     --dp_clip_strategy flat \
-    --dpgrape True \
+    --dptrack True \
+    --oracle_batch_mode $ORACLE_BATCH_MODE \
+    --st_step_size $ST_STEP_SIZE \
+    --st_step_size_scheduler $ST_STEP_SIZE_SCHEDULER \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --subspace_r $SUBSPACE_R \
     --subspace_T $SUBSPACE_T \
