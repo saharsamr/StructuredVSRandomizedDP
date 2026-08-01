@@ -70,6 +70,37 @@ bash experiments/dpgrape/few_shot_sst2.sh
 The results for each individual fine-tuning run will be saved in a .txt file in a folder named output_logs_roberta_few_shot.
 ### Other Experiments
 There are scripts to run the memory experiment, timing experiment, and convergence comparison between DP-GRAPE and DPZero, called memory_exp.sh, timing_exp.sh, and convergence_exp.sh, respectively, which are all in the experiments folder. The results for each of these experiments will be stored in output_logs_roberta_memory_exp, output_logs_roberta_timing_exp, and output_logs_roberta_convergence_exp.
+### Logging to Weights & Biases
+All of the RoBERTa fine-tuning scripts also stream their logs and results to [Weights & Biases](https://wandb.ai). This is on by default; log in once with `wandb login` and the runs show up on their own:
+```bash
+TASK=SST-2 SEED=42 bash roberta_finetuning_dpgrape.sh
+```
+To opt out, either for one run or for a whole shell:
+```bash
+USE_WANDB=false TASK=SST-2 SEED=42 bash roberta_finetuning_dpgrape.sh
+export USE_WANDB=false
+```
+Every RoBERTa script declares `USE_WANDB=${USE_WANDB:-true}` alongside its other settings and passes `--use_wandb $USE_WANDB` on to roberta_finetuning_run.py, so this works the same way for every method (dpgrape, dpgalore, dptrack, dpadam, dpzero, adam) and for each fine-tuning run launched by the scripts in the experiments folder. The .txt log files are still written exactly as before; W&B logging is purely additive.
+
+Each run logs the full argument set as its config (plus the noise multiplier the accountant calibrated, the total batch size, and the trainable parameter count), the training curves at every `logging_steps` (loss, learning rate, peak memory, wall clock), the dev metrics at every `eval_steps`, the subspace diagnostics for DP-GaLore/DPTrack (`subspace/mean_rotation_deg`, `subspace/max_ortho_err`), and the final dev and test metrics as both a logged point and a run summary value. The run is tagged with its method, task, and model, so DP-GRAPE runs can be filtered apart from the eps = infinity methods.
+
+The other W&B settings are environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `USE_WANDB` | `true` | set to `false` to turn logging off |
+| `WANDB_PROJECT` | `structured-vs-randomized-dp` | project to log to |
+| `WANDB_ENTITY` | your default entity | team or user |
+| `WANDB_RUN_NAME` | the grid-search tag | run name, which by default matches the .txt log file name |
+| `WANDB_GROUP` | none | groups runs together, e.g. the seeds of one experiment |
+| `WANDB_TAGS` | none | extra tags, comma separated |
+| `WANDB_MODE` | `online` | use `offline` on a cluster without internet access, then upload later with `wandb sync` |
+
+For example, to group a seed sweep and log offline from a compute node:
+```bash
+WANDB_GROUP=sst2-eps6 WANDB_MODE=offline TASK=SST-2 SEED=42 bash roberta_finetuning_dpgrape.sh
+```
+Under multi-GPU torchrun only rank 0 logs. Because logging is on by default, a machine that is not set up for W&B must never be held up by it: if wandb is not installed, or no API key is configured, or `wandb.init` fails for any other reason (no network, bad entity), the fine-tuning run prints a warning saying what to do and then continues, unaffected and never prompting for input.
 
 ## OPT Fine-Tuning
 (The code for OPT fine-tuning is based on the DPZero repo: https://github.com/Liang137/DPZero)

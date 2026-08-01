@@ -19,6 +19,10 @@ WD=${WD:-0}
 STEP=${STEP:-50}
 EVAL_STEP=${EVAL_STEP:-10000}
 MODEL=${MODEL:-roberta-large}
+
+# Logs and results also stream to Weights & Biases; set USE_WANDB=false to turn that off (see README).
+USE_WANDB=${USE_WANDB:-true}
+
 PRIVACY_EPS=${PRIVACY_EPS:-6.0}
 PRIVACY_DELTA=${PRIVACY_DELTA:-1e-5}
 
@@ -52,6 +56,7 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --dpgrape True \
     --subspace_r 16 \
     --subspace_T 100 \
+    --use_wandb $USE_WANDB \
     --report_to none \
     --log_file $OUT_FILE 
 
@@ -77,6 +82,7 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --dp_delta $PRIVACY_DELTA \
     --dp_clip_strategy flat \
     --dpadam True \
+    --use_wandb $USE_WANDB \
     --report_to none \
     --log_file $OUT_FILE 
 
@@ -95,6 +101,7 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --weight_decay $WD \
     --lr_scheduler_type "constant" \
     --optimizer "adam" \
+    --use_wandb $USE_WANDB \
     --report_to none \
     --log_file $OUT_FILE 
 
@@ -117,5 +124,6 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --dpzero_clip_threshold $C \
     --dpzero True \
     --efficient_zero_order True \
+    --use_wandb $USE_WANDB \
     --report_to none \
     --log_file $OUT_FILE 

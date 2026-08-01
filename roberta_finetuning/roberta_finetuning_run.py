@@ -21,6 +21,7 @@ from roberta_utils.dataset import FewShotDataset, OurInputFeatures
 from roberta_utils.models import MODEL_TYPES, resize_token_type_embeddings
 from roberta_utils.trainer import Trainer
 from roberta_utils.processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
+from roberta_utils import wandb_utils
 
 from filelock import FileLock
 from datetime import datetime
@@ -548,6 +549,42 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "'constant' or 'iterative_decrease' (dptrack only)"}
     )
 
+    # Weights & Biases. Separate from --report_to wandb: the fork of the training loop in
+    # roberta_utils/trainer.py never fires the HF callback events, so we log explicitly.
+    use_wandb: bool = field(
+        default=True,
+        metadata={"help": "log training curves and final metrics to Weights & Biases; "
+                          "pass False (or USE_WANDB=false to the shell scripts) to opt out"}
+    )
+    wandb_project: str = field(
+        default='structured-vs-randomized-dp',
+        metadata={"help": "W&B project name"}
+    )
+    wandb_entity: str = field(
+        default='',
+        metadata={"help": "W&B entity (team or user); empty uses your default"}
+    )
+    wandb_run_name: str = field(
+        default='',
+        metadata={"help": "W&B run name; empty derives one from --log_file"}
+    )
+    wandb_group: str = field(
+        default='',
+        metadata={"help": "W&B group, e.g. set it per experiment to group the seeds together"}
+    )
+    wandb_tags: str = field(
+        default='',
+        metadata={"help": "extra W&B tags, comma separated (method/task/model are added automatically)"}
+    )
+    wandb_mode: str = field(
+        default='online',
+        metadata={"help": "'online', 'offline' (sync later with `wandb sync`), or 'disabled'"}
+    )
+    wandb_dir: str = field(
+        default='',
+        metadata={"help": "where to write the local wandb/ directory; empty uses the cwd"}
+    )
+
 @dataclass
 class MyDataCollatorWithPadding:
     """
@@ -734,6 +771,10 @@ def main():
         training_args.fp16,
     )
     logger.info("Training/evaluation parameters %s", training_args)
+
+    # Start the W&B run before anything expensive, so a crashed run still records its config.
+    # No-op unless --use_wandb was passed; only rank 0 logs.
+    wandb_utils.init(model_args, data_args, training_args)
 
     # Set seed
     set_seed(training_args.seed)
@@ -973,6 +1014,8 @@ def main():
                         logger.info("  %s = %s", key, value)
                         writer.write("%s = %s\n" % (key, value))
                         final_result[eval_dataset.args.task_name + '_dev_' + key] = value
+            wandb_utils.log(eval_result, prefix='final_dev')
+            wandb_utils.set_summary(eval_result, prefix='final_dev')
             eval_results.update(eval_result)
 
     test_results = {}
@@ -1008,6 +1051,8 @@ def main():
                     logits = predictions.reshape([test_dataset.num_sample, -1, num_logits]).mean(axis=0)
                     np.save(os.path.join(training_args.save_logit_dir, "{}-{}-{}.npy".format(test_dataset.task_name, training_args.model_id, training_args.array_id)), logits)
 
+            wandb_utils.log(test_result, prefix='final_test')
+            wandb_utils.set_summary(test_result, prefix='final_test')
             test_results.update(test_result)
 
 
@@ -1023,6 +1068,8 @@ def main():
 
     logger.info('****** Output Dir *******')
     logger.info(training_args.output_dir)
+
+    wandb_utils.finish()
 
     if "LOCAL_RANK" in os.environ:
         dist.destroy_process_group()

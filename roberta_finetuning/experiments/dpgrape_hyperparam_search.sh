@@ -10,6 +10,10 @@ EPS=${EPS:-1e-3}
 WD=${WD:-0}
 EVAL_STEP=${EVAL_STEP:-100}
 MODEL=${MODEL:-roberta-large}
+
+# Logs and results also stream to Weights & Biases; set USE_WANDB=false to turn that off (see README).
+USE_WANDB=${USE_WANDB:-true}
+
 PRIVACY_EPS=${PRIVACY_EPS:-6.0}
 PRIVACY_DELTA=${PRIVACY_DELTA:-1e-5}
 if [ "$TASK" = "SNLI" ]; then
@@ -69,6 +73,7 @@ do
                         --subspace_T $F \
                         --no_train False \
                         --no_predict True \
+                        --use_wandb $USE_WANDB \
                         --report_to none \
                         --log_file $OUT_FILE 
                 done

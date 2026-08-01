@@ -12,6 +12,9 @@ STEP=${STEP:-100}
 EVAL_STEP=${EVAL_STEP:-10000}
 MODEL=${MODEL:-roberta-large}
 
+# Logs and results also stream to Weights & Biases; set USE_WANDB=false to turn that off (see README).
+USE_WANDB=${USE_WANDB:-true}
+
 DP_CLIP_THRESHOLD=${DP_CLIP_THRESHOLD:-10.0}
 PRIVACY_EPS=${PRIVACY_EPS:-6.0}
 PRIVACY_DELTA=${PRIVACY_DELTA:-1e-5}
@@ -55,4 +58,5 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --dpadam True \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --no_train False \
+    --use_wandb $USE_WANDB \
     --report_to none

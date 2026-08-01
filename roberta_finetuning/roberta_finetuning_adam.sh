@@ -11,6 +11,9 @@ STEP=${STEP:-200}
 EVAL_STEP=${EVAL_STEP:-10000}
 MODEL=${MODEL:-roberta-large}
 
+# Logs and results also stream to Weights & Biases; set USE_WANDB=false to turn that off (see README).
+USE_WANDB=${USE_WANDB:-true}
+
 if [ "$TASK" = "SNLI" ]; then
     LOGITS=3
 elif [ "$TASK" = "MNLI" ]; then
@@ -39,4 +42,5 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --optimizer "adam" \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --no_train False \
+    --use_wandb $USE_WANDB \
     --report_to none 

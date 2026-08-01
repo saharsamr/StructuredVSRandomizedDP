@@ -24,4 +24,5 @@ sentence_transformers==3.3.0
 tqdm==4.66.1
 torch==2.7.1+cu128
 transformers>=4.47,<4.50
+wandb>=0.18
 zope.interface>=3.6.0
