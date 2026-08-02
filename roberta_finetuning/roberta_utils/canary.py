@@ -47,6 +47,7 @@
 # buys. It is the scale reference: capture well above chance means the subspace has
 # aligned itself to the data.
 
+import dataclasses
 import json
 import os
 
@@ -155,7 +156,13 @@ class CanaryProbe:
                 shift = 1 + int(torch.randint(self.num_labels - 1, (1,), generator=gen))
                 used_label = (int(true_label) + shift) % self.num_labels
                 for feat_idx in feat_positions:
-                    dataset.features[feat_idx].label = used_label
+                    # OurInputFeatures is @dataclass(frozen=True), so the label cannot be
+                    # assigned; swap in a copy. dataset.features is the only thing holding
+                    # these objects and __getitem__ reads it by index, so replacing the
+                    # list entry is what every later read sees.
+                    dataset.features[feat_idx] = dataclasses.replace(
+                        dataset.features[feat_idx], label=used_label
+                    )
             else:
                 used_label = true_label
             self.canaries.append(
