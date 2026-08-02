@@ -13,11 +13,19 @@
 # real work and nothing is stored. A data-driven subspace cannot be regenerated, so
 # LowRankProjectorDP *stores* the basis and makes generate/clear/update_seed no-ops. The
 # basis itself is produced only by ``update_subspace``, which the trainer calls at subspace
-# update steps with a BARE (unclipped, unnoised) batch gradient.
+# update steps.
 #
-# !!! PRIVACY !!!  The basis is therefore a noiseless function of private data. Both
-# methods built on this file (DP-GaLore and DPTrack-Oracle) are eps = infinity as a whole.
-# The weight *updates* are DP; the subspace is not. See DPTRACK_DESIGN.md section 4.
+# !!! PRIVACY !!!  What ``update_subspace`` is fed decides the privacy of the whole run, and
+# this class does not and cannot check which it got:
+#
+#   --oracle_batch_mode shared | skip    a BARE (unclipped, unnoised) batch gradient. The
+#       basis is then a noiseless function of private data, the weight *updates* are DP but
+#       the subspace is not, and the method is eps = infinity as a whole (DP-GaLore /
+#       DPTrack-Oracle). See DPTRACK_DESIGN.md section 4.
+#
+#   --oracle_batch_mode private-skip     the output of a Gaussian mechanism over the
+#       held-out dev split (dpgrape/private_subspace.py). Everything this class then does is
+#       post-processing, so the run has a finite eps.
 
 import torch
 
@@ -92,7 +100,7 @@ class LowRankProjectorDP:
 
     @torch.no_grad()
     def update_subspace(self, full_rank_grad, iter):
-        """Advance the subspace using a bare batch gradient.
+        """Advance the subspace using a batch gradient (bare, or privatized -- see header).
 
         ``LowRankProjector.project`` is what actually mutates ``ortho_matrix``: at
         ``iter == 0`` it takes the top-r singular vectors, and at ``iter % F == 0`` it

@@ -2,11 +2,25 @@
 #
 # DPTrack-Oracle (bare-gradient SubTrack++ subspace) on RoBERTa-Large, few-shot.
 #
-# WARNING: the subspace is initialized by SVD of the BARE (unclipped, unnoised) batch
-# gradient and then advanced by one rank-1 geodesic step per SUBSPACE_T steps, again on a
-# bare batch gradient. The weight updates are DP; the subspace is not, so this method is
-# eps = infinity as a whole. Do not put its numbers in the same column as DP-GRAPE without
-# saying so. See DPTRACK_DESIGN.md section 4.
+# WARNING (ORACLE_BATCH_MODE=shared or skip): the subspace is initialized by SVD of the BARE
+# (unclipped, unnoised) batch gradient and then advanced by one rank-1 geodesic step per
+# SUBSPACE_T steps, again on a bare batch gradient. The weight updates are DP; the subspace
+# is not, so this method is eps = infinity as a whole. Do not put its numbers in the same
+# column as DP-GRAPE without saying so. See DPTRACK_DESIGN.md section 4.
+#
+# ORACLE_BATCH_MODE=private-skip is the DP-legal version: the gradient that the init SVD and
+# every geodesic step see is drawn from the held-out dev split, clipped per layer to
+# PRIVATE_SKIP_C/sqrt(L) per sample, and noised. The run then has a finite eps. train.tsv and
+# dev.tsv are disjoint, so the subspace mechanism composes in *parallel* with training and
+# the reported guarantee is max(PRIVACY_EPS, PRIVATE_SKIP_EPS) -- see privacy/* in the log.
+#
+# Both private-skip knobs default sensibly, so nothing extra needs passing: PRIVATE_SKIP_EPS
+# tracks PRIVACY_EPS (free, by parallel composition) and PRIVATE_SKIP_C = 2*C. Check
+# subspace/clipped_fraction in the log -- want ~1.0; halve PRIVATE_SKIP_C if it is well below.
+#
+# ST_STEP_SIZE almost certainly needs to be much smaller under private-skip than the value
+# below: the tracker is being driven by a noisy residual, so it only works by averaging many
+# small steps. Watch mean_rotation_deg the same way.
 #
 # Everything except the projector is identical to DP-GRAPE and DP-GaLore: same flat
 # clipping, same noise, same accountant, same DPAdamW, same rank and update period.
@@ -20,6 +34,7 @@
 # defaults below; rescale linearly, since ST_STEP_SIZE and the angle are proportional.
 #
 # Usage:  TASK=SST-2 SEED=42 C=0.5 PRIVACY_EPS=6.0 bash roberta_finetuning_dptrack.sh
+#         ORACLE_BATCH_MODE=private-skip PRIVATE_SKIP_C=8.0 bash roberta_finetuning_dptrack.sh
 
 TASK=${TASK:-SST-2}
 K=${K:-512}
@@ -57,7 +72,20 @@ PRIVACY_DELTA=${PRIVACY_DELTA:-1e-5}
 
 SUBSPACE_R=${SUBSPACE_R:-16}
 SUBSPACE_T=${SUBSPACE_T:-100}
-ORACLE_BATCH_MODE=${ORACLE_BATCH_MODE:-skip}
+ORACLE_BATCH_MODE=${ORACLE_BATCH_MODE:-private-skip}
+
+# private-skip only.
+#
+# The dev-split mechanism gets the *same* epsilon as training: the splits are disjoint, so
+# the two compose in parallel and the reported guarantee is max(6, 6) = 6. Spending less on
+# the subspace would only add noise for nothing.
+PRIVATE_SKIP_EPS=${PRIVATE_SKIP_EPS:-$PRIVACY_EPS}
+# C_sub = 2*C. C bounds a *projected* per-sample gradient, C_sub a full-dimensional one over
+# the 144 projected matrices; the projector shrinks norms by sqrt(rank)=4 and ~15% of the
+# gradient energy sits outside those matrices, which nets out to ~2x. See DPTRACK_DESIGN.md
+# section 4.5. awk, not $((...)), because C is a float.
+PRIVATE_SKIP_C=${PRIVATE_SKIP_C:-$(awk "BEGIN{printf \"%g\", 2*$C}")}
+
 ST_STEP_SIZE=${ST_STEP_SIZE:-10}
 ST_STEP_SIZE_SCHEDULER=${ST_STEP_SIZE_SCHEDULER:-constant}
 
@@ -77,6 +105,9 @@ NUM_GPU=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 BS=$((PER_DEVICE_TRAIN_BS * GRAD_ACCUM_STEPS * NUM_GPU))
 
 GR_TAG=dptrack-$TASK-seed$SEED-bs$BS-lr$LR-dpeps$PRIVACY_EPS-dpdelta$PRIVACY_DELTA-dpC$C-totalsteps$STEP-evalstep$EVAL_STEP-subspace_r$SUBSPACE_R-subspace_T$SUBSPACE_T-batchmode$ORACLE_BATCH_MODE-ststep$ST_STEP_SIZE
+if [ "$ORACLE_BATCH_MODE" = "private-skip" ]; then
+    GR_TAG=$GR_TAG-subeps$PRIVATE_SKIP_EPS-subC$PRIVATE_SKIP_C
+fi
 
 mkdir -p output_logs
 OUT_FILE="output_logs/${GR_TAG}.txt"
@@ -100,6 +131,8 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --dp_clip_strategy flat \
     --dptrack True \
     --oracle_batch_mode $ORACLE_BATCH_MODE \
+    --private_skip_epsilon $PRIVATE_SKIP_EPS \
+    --private_skip_clip_threshold $PRIVATE_SKIP_C \
     --st_step_size $ST_STEP_SIZE \
     --st_step_size_scheduler $ST_STEP_SIZE_SCHEDULER \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \

@@ -67,6 +67,7 @@ from dpgrape.low_rank_projector_dp import (
     attach_low_rank_projectors,
     iter_low_rank_projectors,
 )
+from dpgrape.private_subspace import PerLayerGaussianMechanism
 
 from opacus.utils.module_utils import has_trainable_params
 
@@ -168,14 +169,35 @@ class Trainer(LinearHeadTrainer):
     def low_rank_method(self):
         """'galore', 'subtrack', or None -- which data-driven subspace to track.
 
-        Both are eps = infinity as a whole: the subspace comes from bare (unclipped,
-        unnoised) batch gradients. Only the weight updates are DP. See DPTRACK_DESIGN.md.
+        Under --oracle_batch_mode shared/skip both are eps = infinity as a whole: the
+        subspace comes from bare (unclipped, unnoised) batch gradients and only the weight
+        updates are DP. Under private-skip the subspace is itself a DP release. See
+        DPTRACK_DESIGN.md and ``subspace_is_private``.
         """
         if getattr(self.args, "dpgalore", False):
             return "galore"
         if getattr(self.args, "dptrack", False):
             return "subtrack"
         return None
+
+    @property
+    def subspace_is_private(self):
+        """True when the subspace is estimated from a privatized gradient, not a bare one.
+
+        private-skip clips per-sample gradients per layer, noises the sum, and only then
+        runs the SVD / geodesic step. The subspace is then post-processing of a DP output,
+        so the run has a finite eps -- see ``setup_private_subspace_mechanism`` for how it
+        is accounted.
+        """
+        return (
+            self.low_rank_method is not None
+            and getattr(self.args, "oracle_batch_mode", None) == "private-skip"
+        )
+
+    @property
+    def subspace_uses_dev_split(self):
+        """True for the two modes that draw subspace batches from the held-out dev split."""
+        return getattr(self.args, "oracle_batch_mode", None) in ("skip", "private-skip")
 
     @property
     def uses_projected_dp(self):
@@ -542,12 +564,23 @@ class Trainer(LinearHeadTrainer):
                 model.remove_hooks(keep_ddp_hooks=True)
                 model.add_hooks()
             else:
-                logger.warning(
-                    "*** %s: the subspace is estimated from BARE batch gradients. "
-                    "The weight updates are DP but the subspace is not, so the method as "
-                    "a whole is eps = infinity. Report it separately from DP-GRAPE. ***",
-                    'DP-GaLore' if self.low_rank_method == 'galore' else 'DPTrack-Oracle',
-                )
+                method_label = 'DP-GaLore' if self.low_rank_method == 'galore' else 'DPTrack'
+                if self.subspace_is_private:
+                    logger.warning(
+                        "*** %s (private-skip): the subspace is estimated from per-layer "
+                        "clipped, noised dev-split gradients, so it is post-processing of a "
+                        "DP release and the run has a FINITE eps. See the privacy/* config "
+                        "keys for the accounting. ***",
+                        method_label,
+                    )
+                else:
+                    logger.warning(
+                        "*** %s-Oracle: the subspace is estimated from BARE batch gradients. "
+                        "The weight updates are DP but the subspace is not, so the method as "
+                        "a whole is eps = infinity. Report it separately from DP-GRAPE. "
+                        "Use --oracle_batch_mode private-skip for the DP-legal version. ***",
+                        method_label,
+                    )
                 attach_low_rank_projectors(
                     optimizer,
                     model,
@@ -559,21 +592,29 @@ class Trainer(LinearHeadTrainer):
                         if self.args.st_step_size_scheduler != 'constant' else None
                     ),
                 )
-                # Batch used for the bare backward at subspace update steps.
-                if self.args.oracle_batch_mode == 'skip':
-                    # Held-out dev split: disjoint from train.tsv and from test.tsv by construction.
-                    assert self.eval_dataset is not None, '--oracle_batch_mode skip requires --do_eval'
+                # Batch used for the subspace backward at subspace update steps.
+                if self.subspace_uses_dev_split:
+                    # Held-out dev split: disjoint from train.tsv and from test.tsv by
+                    # construction (generate_k_shot_data.py writes [:k] to train and
+                    # [k:2k] to dev). private-skip's privacy accounting depends on that
+                    # disjointness -- see setup_private_subspace_mechanism.
+                    assert self.eval_dataset is not None, \
+                        f'--oracle_batch_mode {self.args.oracle_batch_mode} requires --do_eval'
                     self.subspace_dataloader = DataLoader(
                         self.eval_dataset,
                         batch_size=self.args.train_batch_size,
                         sampler=RandomSampler(self.eval_dataset),
                         collate_fn=self.data_collator,
+                        # drop_last keeps the batch size fixed, which the accountant assumes.
                         drop_last=True,
                     )
                 else:
                     self.subspace_dataloader = train_dataloader
                 self.subspace_iter = None
                 self.subspace_batches_consumed = 0
+                self.subspace_mechanism = None
+                if self.subspace_is_private:
+                    self.setup_private_subspace_mechanism(optimizer, t_total, multiplier)
 
         elif self.args.dpadam:
             privacy_engine = PrivacyEngine()
@@ -934,7 +975,7 @@ class Trainer(LinearHeadTrainer):
 
 
     def next_subspace_batch(self):
-        """Draw a batch from a dedicated iterator, for --oracle_batch_mode skip."""
+        """Draw a batch from a dedicated iterator, for the dev-split subspace modes."""
         if self.subspace_iter is None:
             self.subspace_iter = iter(self.subspace_dataloader)
         try:
@@ -943,37 +984,184 @@ class Trainer(LinearHeadTrainer):
             self.subspace_iter = iter(self.subspace_dataloader)
             return next(self.subspace_iter)
 
-    def update_low_rank_subspaces(self, model, optimizer, inputs):
-        """One ordinary backward pass, then advance every layer's subspace with it.
+    def setup_private_subspace_mechanism(self, optimizer, t_total, train_noise_multiplier):
+        """Calibrate the Gaussian mechanism that private-skip releases its gradients through.
 
-        This is the non-private half of DP-GaLore / DPTrack-Oracle. Hooks are disabled so
-        opacus does not build per-sample gradients: ``p.grad`` is then the plain batch mean
-        Gbar_raw. Nothing here touches the accountant -- no clipping, no noise, no step.
+        The subspace mechanism is a *separate* mechanism from the training loop's: it runs
+        once per subspace update, at sampling rate ``B / |dev|``, and it only ever touches
+        the dev split. So it gets its own noise multiplier from the accountant, calibrated
+        to --private_skip_epsilon.
+
+        **Why it is legitimate to give the subspace its own full epsilon.** train.tsv and
+        dev.tsv are disjoint (generate_k_shot_data.py), so every record lives in exactly one
+        of them. A neighbouring dataset therefore perturbs either the training releases or
+        the subspace releases, never both, and the two chains compose in *parallel*: the
+        guarantee for a record is max(eps_train, eps_subspace), not their sum. The dev-side
+        releases are also post-processing from the training side's point of view (they are
+        functions of the public weights and of D_dev), and vice versa, so the interleaving is
+        just adaptive composition within each chain.
+
+        Both numbers are logged. eps_sequential is also logged as the conservative fallback
+        for anyone who would rather not lean on the disjointness.
+        """
+        if "LOCAL_RANK" in os.environ:
+            raise NotImplementedError(
+                "--oracle_batch_mode private-skip is single-process only: per-sample "
+                "clipping is done with a microbatch-of-one loop that is not synchronized "
+                "across ranks."
+            )
+
+        projected_params = [p for p, _ in iter_low_rank_projectors(optimizer)]
+        if not projected_params:
+            raise RuntimeError("private-skip found no projected parameters to privatize")
+
+        num_dev = len(self.eval_dataset)
+        batch_size = self.args.train_batch_size
+        if batch_size > num_dev:
+            raise ValueError(
+                f"subspace batch size {batch_size} exceeds the dev split ({num_dev} examples)"
+            )
+
+        # Trigger is `global_step % subspace_T == 0`, so updates land on 0, T, 2T, ...
+        # Count the endpoint too: the loop's break is `global_step > max_steps`, so a run can
+        # reach global_step == t_total and take one more. Over-counting only ever adds noise.
+        num_updates = (t_total // self.args.subspace_T) + 1
+        sample_rate = batch_size / num_dev
+
+        target_eps = self.args.private_skip_epsilon
+        if target_eps <= 0:
+            target_eps = self.args.dp_epsilon
+        clip_threshold = self.args.private_skip_clip_threshold
+        if clip_threshold <= 0:
+            # C bounds a *projected* per-sample gradient, C_sub a full-dimensional one over
+            # the projected matrices only. The projector shrinks norms by sqrt(rank) and some
+            # gradient energy sits outside those matrices; at rank 16 and RoBERTa-Large's
+            # ~85/15 split that nets out to ~2x. See DPTRACK_DESIGN.md section 4.5.
+            clip_threshold = 2.0 * self.args.dp_clip_threshold
+            logger.info(
+                "private-skip: C_sub defaulted to 2 * --dp_clip_threshold = %.4g. Check "
+                "subspace/clipped_fraction (want ~1.0) and mean_sample_norm_pre_clip; halve "
+                "it if the clip is barely binding.",
+                clip_threshold,
+            )
+
+        sigma = get_noise_multiplier(
+            target_epsilon=target_eps,
+            target_delta=self.args.dp_delta,
+            steps=num_updates,
+            sample_rate=sample_rate,
+        )
+        self.subspace_mechanism = PerLayerGaussianMechanism(
+            params=projected_params,
+            clip_threshold=clip_threshold,
+            noise_multiplier=sigma,
+            expected_batch_size=batch_size,
+        )
+
+        privacy = {
+            "eps_train": self.args.dp_epsilon,
+            "eps_subspace": target_eps,
+            # Disjoint splits => parallel composition; this is the number to report.
+            "eps_parallel": max(self.args.dp_epsilon, target_eps),
+            # If you refuse the disjointness argument, this is the fallback.
+            "eps_sequential": self.args.dp_epsilon + target_eps,
+            "delta": self.args.dp_delta,
+            "train_noise_multiplier": train_noise_multiplier,
+            "subspace_noise_multiplier": sigma,
+            "subspace_steps": num_updates,
+            "subspace_sample_rate": sample_rate,
+            "subspace_dev_examples": num_dev,
+            "subspace_clip_threshold": clip_threshold,
+            "subspace_per_layer_clip": self.subspace_mechanism.per_layer_clip,
+            "subspace_num_layers": self.subspace_mechanism.num_layers,
+            "subspace_released_noise_std": self.subspace_mechanism.released_noise_std,
+        }
+        logger.warning("*** private-skip privacy accounting: %s ***", privacy)
+        wandb_utils.update_config({f"privacy/{k}": v for k, v in privacy.items()})
+
+    def privatized_subspace_gradients(self, model, optimizer, batch):
+        """Per-layer clipped, noised batch gradient for the projected weight matrices.
+
+        One backward per sample, with opacus' hooks off, so ``p.grad`` holds exactly that
+        sample's gradient and the clip bounds a real per-sample contribution. A larger
+        microbatch would clip a microbatch *mean*, which bounds nothing.
+
+        The cost is B small backwards instead of one big one -- at the defaults (B=64,
+        subspace_T=100, 1000 steps) that is roughly a few percent of total training time,
+        and it uses *less* memory than a DP step, which materializes per-sample gradients.
+        """
+        mech = self.subspace_mechanism
+        mech.reset()
+
+        batch = self._prepare_inputs(batch)
+        # Every field the collator emits is batch-first (input_ids, attention_mask, labels,
+        # mask_pos, ...), so slicing dim 0 gives a well-formed single-example batch.
+        sizes = {v.shape[0] for v in batch.values() if torch.is_tensor(v) and v.dim() > 0}
+        if len(sizes) != 1:
+            raise RuntimeError(f"could not infer the subspace batch size, saw {sizes}")
+        batch_size = sizes.pop()
+
+        for i in range(batch_size):
+            micro = {
+                k: (v[i:i + 1] if torch.is_tensor(v) and v.dim() > 0 else v)
+                for k, v in batch.items()
+            }
+            optimizer.zero_grad()
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, micro)
+            if self.args.n_gpu > 1:
+                loss = loss.mean()
+            # compute_loss averages over the batch; with one sample that *is* the sample's
+            # loss, so p.grad after backward is the per-sample gradient.
+            loss.backward()
+            mech.accumulate()
+
+        optimizer.zero_grad()
+        return mech.release()
+
+    def update_low_rank_subspaces(self, model, optimizer, inputs):
+        """Advance every layer's subspace from one batch gradient.
 
         oracle_batch_mode:
-          shared  reuse this step's training batch (one extra backward, no data wasted)
-          skip    draw a batch from the held-out dev split, no weight update
+          shared        reuse this step's training batch, bare gradient      (eps = infinity)
+          skip          held-out dev batch, bare gradient, no weight update  (eps = infinity)
+          private-skip  held-out dev batch, per-layer clipped and noised     (finite eps)
+
+        For shared/skip the hooks are disabled so opacus does not build per-sample
+        gradients and ``p.grad`` is the plain batch mean Gbar_raw; nothing touches the
+        accountant. For private-skip the gradient handed to the projector is the output of
+        a Gaussian mechanism, so the SVD / geodesic step downstream is post-processing.
         """
-        skip_mode = self.args.oracle_batch_mode == 'skip'
-        batch = self.next_subspace_batch() if skip_mode else inputs
+        batch = self.next_subspace_batch() if self.subspace_uses_dev_split else inputs
 
         model.train()   # self.evaluate() may have left the model in eval mode
         optimizer.zero_grad()
         model.disable_hooks()
+        grads = None
         try:
-            batch = self._prepare_inputs(batch)
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, batch)
-            if self.args.n_gpu > 1:
-                loss = loss.mean()
-            loss.backward()
+            if self.subspace_is_private:
+                grads = self.privatized_subspace_gradients(model, optimizer, batch)
+            else:
+                batch = self._prepare_inputs(batch)
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, batch)
+                if self.args.n_gpu > 1:
+                    loss = loss.mean()
+                loss.backward()
+                # left as None on purpose: the bare modes read p.grad one layer at a time,
+                # so they never hold a second copy of every projected gradient at once.
 
             with torch.no_grad():
                 for p, projector in iter_low_rank_projectors(optimizer):
-                    if p.grad is None:
+                    if grads is not None:
+                        grad = grads.pop(p, None)
+                    else:
+                        grad = None if p.grad is None else p.grad.detach().float()
+                    if grad is None:
                         continue
-                    projector.update_subspace(p.grad.detach().float(), self.state.global_step)
+                    projector.update_subspace(grad, self.state.global_step)
         finally:
+            grads = None
             optimizer.zero_grad()
             model.enable_hooks()
 
@@ -994,6 +1182,11 @@ class Trainer(LinearHeadTrainer):
             "mean_rotation_deg": float(np.mean(rotations)) if rotations else None,
             "max_ortho_err": float(np.max(ortho_errs)) if ortho_errs else None,
         }
+        if self.subspace_is_private:
+            # mean_sample_norm_pre_clip vs per_layer_clip * sqrt(num_layers) is how you tell
+            # whether C_sub is set anywhere near the right scale: clipped_fraction near 1.0
+            # with a mean norm far above C means almost all signal is being thrown away.
+            diagnostics.update(self.subspace_mechanism.diagnostics())
         logger.info(str(diagnostics))
         # mean_rotation_deg is the number to watch for dptrack (see roberta_finetuning_dptrack.sh):
         # near 0 means the tracker is a no-op, huge means it is thrashing.
