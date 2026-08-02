@@ -537,8 +537,29 @@ class DynamicTrainingArguments(TrainingArguments):
     oracle_batch_mode: str = field(
         default='shared',
         metadata={
-            "help": "'shared' reuses the training batch for the bare backward; "
-                    "'skip' uses the held-out dev split and takes no weight update on it"}
+            "help": "where the subspace gradient comes from. "
+                    "'shared' reuses the training batch for a bare backward (eps = inf); "
+                    "'skip' uses the held-out dev split, bare, no weight update (eps = inf); "
+                    "'private-skip' uses the held-out dev split with per-layer clipping and "
+                    "Gaussian noise, which makes the subspace a DP release (finite eps)"}
+    )
+    private_skip_epsilon: float = field(
+        default=-1.0,
+        metadata={
+            "help": "target epsilon for the dev-split subspace mechanism (private-skip only). "
+                    "train.tsv and dev.tsv are disjoint, so this composes in parallel with "
+                    "--dp_epsilon and the reported guarantee is the max of the two, not the "
+                    "sum -- which is why the default matches --dp_epsilon rather than "
+                    "splitting a budget. <= 0 means reuse --dp_epsilon."}
+    )
+    private_skip_clip_threshold: float = field(
+        default=-1.0,
+        metadata={
+            "help": "C_sub: L2 bound on one sample's contribution across all projected "
+                    "matrices, for the private-skip mechanism (per-layer clip is "
+                    "C_sub/sqrt(L)). These gradients are full-dimensional while "
+                    "--dp_clip_threshold bounds a projected one, which is worth ~2x at "
+                    "rank 16. <= 0 means 2 * --dp_clip_threshold."}
     )
     st_step_size: float = field(
         default=10.0,
@@ -691,8 +712,19 @@ def main():
     if sum([training_args.dpgrape, training_args.dpgalore, training_args.dptrack]) > 1:
         raise ValueError('pick at most one of --dpgrape / --dpgalore / --dptrack')
 
-    if training_args.oracle_batch_mode not in ('shared', 'skip'):
-        raise ValueError("--oracle_batch_mode must be 'shared' or 'skip'")
+    if training_args.oracle_batch_mode not in ('shared', 'skip', 'private-skip'):
+        raise ValueError("--oracle_batch_mode must be 'shared', 'skip' or 'private-skip'")
+
+    if training_args.oracle_batch_mode == 'private-skip':
+        if not (training_args.dpgalore or training_args.dptrack):
+            raise ValueError(
+                "--oracle_batch_mode private-skip only applies to --dpgalore / --dptrack"
+            )
+        if not training_args.do_eval:
+            raise ValueError(
+                "--oracle_batch_mode private-skip draws its subspace batches from the "
+                "held-out dev split, so it needs --do_eval to build that dataset"
+            )
 
     if 'prompt' in model_args.few_shot_type:
         data_args.prompt = True

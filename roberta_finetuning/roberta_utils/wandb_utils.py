@@ -43,6 +43,8 @@ _HIGHLIGHT_KEYS = (
     ("train", "subspace_r", "subspace_r"),
     ("train", "subspace_T", "subspace_T"),
     ("train", "oracle_batch_mode", "oracle_batch_mode"),
+    ("train", "private_skip_epsilon", "private_skip_epsilon"),
+    ("train", "private_skip_clip_threshold", "private_skip_clip_threshold"),
     ("train", "st_step_size", "st_step_size"),
 )
 
@@ -55,12 +57,16 @@ def is_active():
 def method_name(training_args):
     """Short name of the optimization method, used for the run tags and config.
 
-    Note that dpgalore and dptrack are eps = infinity as a whole (their subspace comes from
-    bare batch gradients); the tag is there so those runs are easy to filter out of a
-    comparison against the genuinely private methods.
+    dpgalore and dptrack are eps = infinity as a whole under --oracle_batch_mode
+    shared/skip (their subspace comes from bare batch gradients), and finite-eps under
+    private-skip. The suffix keeps the two apart, so an eps = infinity run can never be
+    mistaken for a private one in the runs table.
     """
     for flag in ("dpgrape", "dpgalore", "dptrack", "dpzero", "dpadam"):
         if getattr(training_args, flag, False):
+            if flag in ("dpgalore", "dptrack") and \
+                    getattr(training_args, "oracle_batch_mode", None) == "private-skip":
+                return f"{flag}-private"
             return flag
     return getattr(training_args, "optimizer", "unknown")
 
