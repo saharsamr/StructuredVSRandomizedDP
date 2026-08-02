@@ -53,6 +53,7 @@ import torch.nn.functional as F
 
 from .linearhead_trainer import LinearHeadTrainer
 from . import wandb_utils
+from .canary import CanaryProbe
 from transformers.trainer_callback import TrainerState
 
 import copy
@@ -164,6 +165,10 @@ class Trainer(LinearHeadTrainer):
     """
     Adding some functions based on Transformers' Trainer class.
     """
+
+    # Set by roberta_finetuning_run.py when --canary_probe is on. Scored after every
+    # subspace update; see roberta_utils/canary.py for what it measures.
+    canary_probe = None
 
     @property
     def low_rank_method(self):
@@ -1146,6 +1151,7 @@ class Trainer(LinearHeadTrainer):
         optimizer.zero_grad()
         model.disable_hooks()
         grads = None
+        canary_summary = None
         try:
             if self.subspace_is_private:
                 grads = self.privatized_subspace_gradients(model, optimizer, batch)
@@ -1168,6 +1174,14 @@ class Trainer(LinearHeadTrainer):
                     if grad is None:
                         continue
                     projector.update_subspace(grad, self.state.global_step)
+
+            # Score the dev canaries against the subspace this batch just produced. Inside
+            # the try so it still runs with hooks disabled (it needs a plain p.grad, not a
+            # per-sample one) and outside the no_grad block because it backwards.
+            if self.canary_probe is not None:
+                canary_summary = self.canary_probe.measure(
+                    self, model, optimizer, self.state.global_step
+                )
         finally:
             grads = None
             optimizer.zero_grad()
@@ -1195,6 +1209,8 @@ class Trainer(LinearHeadTrainer):
             # whether C_sub is set anywhere near the right scale: clipped_fraction near 1.0
             # with a mean norm far above C means almost all signal is being thrown away.
             diagnostics.update(self.subspace_mechanism.diagnostics())
+        if canary_summary is not None:
+            diagnostics.update(canary_summary)
         logger.info(str(diagnostics))
         # mean_rotation_deg is the number to watch for dptrack (see roberta_finetuning_dptrack.sh):
         # near 0 means the tracker is a no-op, huge means it is thrashing.
