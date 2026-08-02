@@ -35,6 +35,10 @@
 #
 # Usage:  TASK=SST-2 SEED=42 C=0.5 PRIVACY_EPS=6.0 bash roberta_finetuning_dptrack.sh
 #         ORACLE_BATCH_MODE=private-skip PRIVATE_SKIP_C=8.0 bash roberta_finetuning_dptrack.sh
+#
+# Any extra arguments are forwarded to roberta_finetuning_run.py and, being last, override
+# the flags set below. That is how experiments/canary_leak_exp.sh adds --canary_probe
+# without duplicating this script's hyperparameters -- the arms have to be identical.
 
 TASK=${TASK:-SST-2}
 K=${K:-512}
@@ -141,4 +145,5 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --use_wandb $USE_WANDB \
     --report_to none \
     --log_file $OUT_FILE \
-    --no_train False
+    --no_train False \
+    "$@"

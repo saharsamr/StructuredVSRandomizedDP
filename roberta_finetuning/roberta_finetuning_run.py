@@ -22,6 +22,7 @@ from roberta_utils.models import MODEL_TYPES, resize_token_type_embeddings
 from roberta_utils.trainer import Trainer
 from roberta_utils.processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
 from roberta_utils import wandb_utils
+from roberta_utils.canary import CanaryProbe
 
 from filelock import FileLock
 from datetime import datetime
@@ -570,6 +571,33 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "'constant' or 'iterative_decrease' (dptrack only)"}
     )
 
+    # Dev-split canary probe. Measures whether the data-driven subspace responds to single
+    # dev records; see roberta_utils/canary.py for what is measured and why.
+    canary_probe: bool = field(
+        default=False,
+        metadata={
+            "help": "flip half the dev labels and, after every subspace update, log how "
+                    "much of each dev example's gradient the subspace captures. Run it for "
+                    "--oracle_batch_mode skip (expect a gap), private-skip (expect none) "
+                    "and shared (placebo -- the subspace never sees dev). WARNING: this "
+                    "corrupts the dev labels, so eval metrics from the run are meaningless"}
+    )
+    num_canaries: int = field(
+        default=-1,
+        metadata={
+            "help": "how many dev examples to put under test; -1 (default) uses all of "
+                    "them, which is what you want for a k-shot dev split"}
+    )
+    canary_seed: int = field(
+        default=0,
+        metadata={"help": "picks which dev examples are canaries and which half gets flipped"}
+    )
+    canary_log: str = field(
+        default='',
+        metadata={"help": "JSONL output path for the probe; empty writes "
+                          "canary_probe.jsonl into --output_dir"}
+    )
+
     # Weights & Biases. Separate from --report_to wandb: the fork of the training loop in
     # roberta_utils/trainer.py never fires the HF callback events, so we log explicitly.
     use_wandb: bool = field(
@@ -724,6 +752,31 @@ def main():
             raise ValueError(
                 "--oracle_batch_mode private-skip draws its subspace batches from the "
                 "held-out dev split, so it needs --do_eval to build that dataset"
+            )
+
+    if training_args.canary_probe:
+        if not (training_args.dpgalore or training_args.dptrack):
+            raise ValueError(
+                "--canary_probe measures a data-driven subspace, so it needs --dpgalore "
+                "or --dptrack. DP-GRAPE's projector is random and independent of the data, "
+                "so its capture is r/d for every example by construction -- there is "
+                "nothing to probe"
+            )
+        if not training_args.do_eval:
+            raise ValueError(
+                "--canary_probe plants its canaries in the dev split, so it needs "
+                "--do_eval to build that dataset"
+            )
+        if training_args.evaluate_during_training:
+            raise ValueError(
+                "--canary_probe deliberately corrupts dev labels, so model selection "
+                "against the dev objective would be meaningless. Re-run without "
+                "--evaluate_during_training"
+            )
+        if "LOCAL_RANK" in os.environ:
+            raise NotImplementedError(
+                "--canary_probe is single-process only: it backwards one canary at a "
+                "time and every rank would append to the same log. Run it on one GPU"
             )
 
     if 'prompt' in model_args.few_shot_type:
@@ -974,6 +1027,30 @@ def main():
         data_collator=MyDataCollatorWithPadding(tokenizer),
         **trainer_kwargs
     )
+
+    # Plant the canaries before training: the flipped labels have to be in place by the
+    # time the first subspace batch is drawn from the dev split.
+    if training_args.canary_probe:
+        canary_log = training_args.canary_log or os.path.join(
+            training_args.output_dir, 'canary_probe.jsonl'
+        )
+        trainer.canary_probe = CanaryProbe(
+            dataset=eval_dataset,
+            num_canaries=training_args.num_canaries,
+            seed=training_args.canary_seed,
+            log_path=canary_log,
+        )
+        trainer.canary_probe.start_log(extra={
+            'task_name': data_args.task_name,
+            'method': 'galore' if training_args.dpgalore else 'subtrack',
+            'oracle_batch_mode': training_args.oracle_batch_mode,
+            'subspace_r': training_args.subspace_r,
+            'subspace_T': training_args.subspace_T,
+            'max_steps': training_args.max_steps,
+            'dp_epsilon': training_args.dp_epsilon,
+            'dp_clip_threshold': training_args.dp_clip_threshold,
+            'seed': training_args.seed,
+        })
 
     # Calibration
     if model_args.sfc:
