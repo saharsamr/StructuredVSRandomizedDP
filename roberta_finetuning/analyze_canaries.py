@@ -1,52 +1,57 @@
 #!/usr/bin/env python
 """Read canary_probe.jsonl logs and print every number the experiment produces.
 
-    python analyze_canaries.py out/skip/canary_probe.jsonl out/private-skip/canary_probe.jsonl ...
+    python analyze_canaries.py canary_logs/<run>/skip.jsonl canary_logs/<run>/private-skip.jsonl
 
-For each run it prints the per-subspace-update capture of the flipped and the clean group,
-the gap between them, and a significance test; then one comparison table across runs.
+What is being measured
+----------------------
+Every dev example gets a capture score at each subspace update:
 
-Reading the output
-------------------
-gap = mean capture(flipped) - mean capture(clean).
+    capture = || U^T g ||^2 / || g ||^2      summed over the projected matrices
 
-The raw gap is NOT the leakage estimate, because it mixes two effects:
+the fraction of that example's gradient energy the subspace keeps. Chance, for a random
+rank-r subspace, is r/d.
 
-  (a) the leak: the subspace was fitted to a batch containing these canaries and chased
-      them, so their gradients are captured more.
-  (b) geometry: a mislabeled example has a large gradient pointing somewhere unusual, and
-      any subspace fitted to any natural batch captures unusual directions less well. This
-      shows up as a *negative* gap and is present even when the subspace provably never
-      saw the canaries.
+THE MAIN TEST: membership
+-------------------------
+Each subspace update draws one batch (64 of the dev pool). Only those 64 fed the subspace.
+A fraction of the dev split is also fenced off from every batch, as a permanent control.
+So at every update the canaries fall into three groups:
 
-The shared arm isolates (b): its subspace is fitted to the train batch, so it cannot
-contain any information about the dev canaries, and whatever gap it shows is pure geometry.
-The leakage estimate is therefore the baseline-adjusted gap,
+    fed      drawn at this update -- influenced the subspace that is being scored
+    prior    drawn at an earlier update -- influenced it, but several rotations ago
+    holdout  fenced off, never drawn at any update -- provably never touched the subspace
 
-    adjusted = gap(arm) - gap(shared)
+fed vs holdout is the test. Both groups are the same records with the same flipped labels,
+split only by the seed, so they are identical in distribution and nothing has to be
+subtracted off. The question it asks is the privacy question directly: was this record in
+the data that produced this subspace?
 
-which is what the ADJUSTED table reports and what you should quote. It is a bias
-correction, not a perfect counterfactual: the shared run trains along a different subspace
-trajectory, so its geometry offset is close to but not identical to the one inside a skip
-run. Run it anyway -- an unadjusted gap is the more wrong number.
+    fed > holdout, significant  the subspace carries information about which individual
+                                records built it. Under --oracle_batch_mode skip that is
+                                the leak, measured.
+    fed ~ holdout               no detectable per-record response. Expected for
+                                private-skip: clipping bounds each record's pull on the
+                                subspace and the noise covers what is left.
 
-  adjusted > 0, significant   the subspace responds to individual dev records. Under
-                              --oracle_batch_mode skip that is the leak, measured.
-  adjusted ~ 0                no detectable per-record response. Expected for private-skip:
-                              clipping bounds each record's pull on the SVD and the noise
-                              covers what is left.
+fed > prior > holdout, decaying in that order, is the corroborating pattern for a tracker
+that accumulates (subtrack): influence fading as the subspace rotates away is much harder
+to explain as noise than a single two-group difference. GaLore refits from scratch every
+update, so it should show fed >> prior ~ holdout with no gradient in between -- a flat
+prior there is expected, not a problem.
 
-capture/chance says whether the subspace is aligned to gradients at all: 1.0 means it is
-no better than a random rank-r subspace, and a gap measured under a subspace that is not
-tracking anything is not evidence about a subspace that is.
+THE SECONDARY TEST: flipped vs clean
+------------------------------------
+Also reported, restricted to the fed group. This one is NOT self-controlled: a mislabeled
+example's gradient points somewhere unusual, and a subspace fitted to any natural batch
+captures unusual directions less well, which shows up as a negative offset even when the
+subspace never saw the record. A 'shared' run measures that offset (its subspace is fitted
+to the train batch, so it cannot have seen any dev canary) and it is subtracted where
+available. Prefer the membership test, which needs no such correction.
 
-Significance
-------------
-Within one step, flipped and clean are disjoint sets of examples, so the two-sample Welch
-test printed per step is valid. Across steps the same canaries recur, so those records are
-correlated and pooling them all into one big test would fake significance. The headline
-per-run test therefore treats each subspace update as a single observation of the gap and
-runs a one-sample t-test on those K numbers against 0. It is the conservative choice.
+capture/chance says whether the subspace is aligned to gradients at all. 1.0 means it is no
+better than a random rank-r subspace, and a difference measured under a subspace that is
+not tracking is not evidence about a subspace that is.
 """
 
 import argparse
@@ -79,8 +84,11 @@ def _mean_var(xs):
     mean = sum(xs) / n
     if n == 1:
         return mean, 0.0, 1
-    var = sum((x - mean) ** 2 for x in xs) / (n - 1)
-    return mean, var, n
+    return mean, sum((x - mean) ** 2 for x in xs) / (n - 1), n
+
+
+def mean(xs):
+    return sum(xs) / len(xs) if xs else float('nan')
 
 
 def welch(a, b):
@@ -91,7 +99,8 @@ def welch(a, b):
         return None
     se2 = va / na + vb / nb
     if se2 <= 0.0:
-        return (ma - mb, float('inf') if ma != mb else 0.0, na + nb - 2, 0.0 if ma != mb else 1.0)
+        return (ma - mb, float('inf') if ma != mb else 0.0, na + nb - 2,
+                0.0 if ma != mb else 1.0)
     t = (ma - mb) / math.sqrt(se2)
     df = se2 ** 2 / ((va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1))
     return ma - mb, t, df, _sf(t, df)
@@ -99,20 +108,24 @@ def welch(a, b):
 
 def one_sample_t(xs):
     """One-sample t-test against 0. Returns (mean, se, t, df, p) or None."""
-    mean, var, n = _mean_var(xs)
+    m, var, n = _mean_var(xs)
     if n < 2:
         return None
     se = math.sqrt(var / n)
     if se == 0.0:
-        return (mean, 0.0, float('inf') if mean != 0 else 0.0, n - 1, 0.0 if mean != 0 else 1.0)
-    t = mean / se
-    return mean, se, t, n - 1, _sf(t, n - 1)
+        return (m, 0.0, float('inf') if m != 0 else 0.0, n - 1, 0.0 if m != 0 else 1.0)
+    return m, se, m / se, n - 1, _sf(m / se, n - 1)
 
 
 # -------------------------------------------------------------------------------- input
 
 def load(path):
-    """Return (manifest, {step: [record, ...]})."""
+    """Return (manifest, {step: [record, ...]}), each record tagged fed/prior/holdout.
+
+    'prior' needs the history, so the tagging is done here, in one pass over the sorted
+    steps, rather than in the probe: the probe only records whether each canary was in the
+    batch it just saw.
+    """
     manifest = None
     by_step = defaultdict(list)
     with open(path) as f:
@@ -132,6 +145,33 @@ def load(path):
             f"{path}: manifest but no measurements. The run never reached a subspace "
             f"update, or --canary_probe was on for a method without a data-driven subspace"
         )
+
+    seen_before = set()
+    for step in sorted(by_step):
+        drawn_here = set()
+        for rec in by_step[step]:
+            if "in_batch" not in rec:
+                rec["group"] = None          # shared mode: no dev draw to attribute
+                continue
+            if rec.get("held_out"):
+                # Fenced off from every batch, so it can never be 'fed' or 'prior'.
+                rec["group"] = "holdout"
+            elif rec["in_batch"]:
+                rec["group"] = "fed"
+                drawn_here.add(rec["query_idx"])
+            elif rec["query_idx"] in seen_before:
+                rec["group"] = "prior"
+            else:
+                rec["group"] = "notyet"
+        seen_before |= drawn_here
+
+    if not any(r.get("group") == "holdout" for r in by_step[sorted(by_step)[0]]):
+        # Older logs, or --canary_holdout_frac 0. 'not drawn yet' is the only control
+        # available; it empties out once the sampler has been through an epoch.
+        for step in by_step:
+            for rec in by_step[step]:
+                if rec.get("group") == "notyet":
+                    rec["group"] = "holdout"
     return manifest, by_step
 
 
@@ -143,12 +183,22 @@ def label_for(manifest, path):
     return f"{method}/{mode}"
 
 
+def caps(recs, group=None, flipped=None):
+    out = []
+    for r in recs:
+        if group is not None and r.get("group") != group:
+            continue
+        if flipped is not None and r["flipped"] != flipped:
+            continue
+        out.append(r["capture"])
+    return out
+
+
 # ------------------------------------------------------------------------------- report
 
 def report_run(path, manifest, by_step, verbose=True):
-    """Print one run's tables. Returns the row for the comparison table."""
     name = label_for(manifest, path)
-    print("=" * 92)
+    print("=" * 100)
     print(f"RUN  {name}")
     print(f"file {path}")
     cfg = "  ".join(
@@ -161,158 +211,199 @@ def report_run(path, manifest, by_step, verbose=True):
         print(f"cfg  {cfg}")
     print(f"     {manifest['num_canaries']} canaries: "
           f"{manifest['num_flipped']} flipped / {manifest['num_clean']} clean, "
-          f"{manifest['num_labels']} classes, "
-          f"canary seed {manifest.get('canary_seed', '?')}")
-    print()
+          f"{manifest['num_labels']} classes")
 
     steps = sorted(by_step)
-    if verbose:
-        print(f"{'step':>7} {'n_flip':>7} {'n_clean':>8} {'capture_flip':>13} "
-              f"{'capture_clean':>14} {'gap':>11} {'chance':>10} {'cap/chance':>11} "
-              f"{'t':>8} {'p':>9}")
-        print("-" * 92)
+    tagged = any(r.get("group") for r in by_step[steps[0]])
+    print()
 
-    gaps, rows = [], []
+    row = {"name": name, "path": path, "mode": manifest.get("oracle_batch_mode", "?"),
+           "method": manifest.get("method", "?"), "tagged": tagged}
+
+    # ---------------------------------------------------------------- membership test
+    if tagged:
+        if verbose:
+            print("  MEMBERSHIP  (flipped canaries only; fed = drawn into this update's "
+                  "subspace batch)")
+            print()
+            print(f"  {'step':>7} {'n_fed':>6} {'n_hold':>8} {'fed':>10} {'prior':>10} "
+                  f"{'holdout':>10} {'fed-hold':>12} {'t':>8} {'p':>9}")
+            print("  " + "-" * 96)
+
+        diffs, decay_ok, decay_n = [], 0, 0
+        for step in steps:
+            recs = by_step[step]
+            fed = caps(recs, "fed", flipped=True)
+            prior = caps(recs, "prior", flipped=True)
+            held = caps(recs, "holdout", flipped=True)
+            w = welch(fed, held)
+            if w is None:
+                continue
+            diff, t, df, p = w
+            diffs.append(diff)
+            if prior:
+                decay_n += 1
+                if mean(fed) >= mean(prior) >= mean(held):
+                    decay_ok += 1
+            if verbose:
+                print(f"  {step:>7} {len(fed):>6} {len(held):>8} {mean(fed):>10.6f} "
+                      f"{mean(prior):>10.6f} {mean(held):>10.6f} {diff:>+12.6f} "
+                      f"{t:>8.3f} {p:>9.4f}")
+        print()
+        res = one_sample_t(diffs)
+        if res is None:
+            print(f"  not enough updates with both groups to test ({len(diffs)})")
+            row["mem_gap"] = diffs[0] if diffs else float('nan')
+            row["mem_p"] = float('nan')
+        else:
+            m, se, t, df, p = res
+            row["mem_gap"], row["mem_se"], row["mem_p"] = m, se, p
+            print(f"  HEADLINE   fed - holdout over {len(diffs)} updates = "
+                  f"{m:+.6f} +/- {se:.6f} (se)")
+            print(f"             one-sample t = {t:.3f}, df = {df}, p = {p:.4g}")
+            if decay_n:
+                print(f"             fed >= prior >= holdout at {decay_ok}/{decay_n} "
+                      f"updates that had a prior group")
+    else:
+        print("  MEMBERSHIP  not available: this run has no dev-split subspace batch")
+        print("              (oracle_batch_mode=shared fits the subspace to the train "
+              "batch). Used below")
+        print("              as the geometry baseline for the flipped-vs-clean test only.")
+        print()
+
+    # --------------------------------------------------------- flipped vs clean (2nd)
+    fc_diffs, cap_all, chance_all = [], [], []
     for step in steps:
         recs = by_step[step]
-        flip = [r["capture"] for r in recs if r["flipped"]]
-        clean = [r["capture"] for r in recs if not r["flipped"]]
-        chance = [r["chance"] for r in recs]
-        w = welch(flip, clean)
-        if w is None:
-            continue
-        gap, t, df, p = w
-        mflip = sum(flip) / len(flip)
-        mclean = sum(clean) / len(clean)
-        mchance = sum(chance) / len(chance) if chance else float('nan')
-        gaps.append(gap)
-        rows.append((step, mflip, mclean, gap, mchance))
-        if verbose:
-            ratio = (mflip + mclean) / 2 / mchance if mchance else float('nan')
-            print(f"{step:>7} {len(flip):>7} {len(clean):>8} {mflip:>13.6f} "
-                  f"{mclean:>14.6f} {gap:>+11.6f} {mchance:>10.6f} {ratio:>11.3f} "
-                  f"{t:>8.3f} {p:>9.4f}")
-
-    if not rows:
-        print("  (no step had enough canaries in both groups to test)")
-        return None
-
+        pool = [r for r in recs if r.get("group") == "fed"] if tagged else recs
+        cap_all += [r["capture"] for r in pool]
+        chance_all += [r["chance"] for r in pool]
+        w = welch(caps(pool, flipped=True), caps(pool, flipped=False))
+        if w is not None:
+            fc_diffs.append(w[0])
+    res = one_sample_t(fc_diffs)
+    scope = "fed only" if tagged else "all canaries"
     print()
-    res = one_sample_t(gaps)
-    mean_chance = sum(r[4] for r in rows) / len(rows)
-    mean_capture = sum((r[1] + r[2]) / 2 for r in rows) / len(rows)
     if res is None:
-        print(f"  only {len(gaps)} subspace update(s) -- need >= 2 for the run-level test")
-        mean_gap = gaps[0]
-        se = t = p = float('nan')
-        df = 0
+        print(f"  flipped - clean ({scope}): only {len(fc_diffs)} usable update(s)")
+        row["fc_gap"], row["fc_p"] = (fc_diffs[0] if fc_diffs else float('nan')), float('nan')
     else:
-        mean_gap, se, t, df, p = res
-        print(f"  RAW GAP   over {len(gaps)} subspace updates = "
-              f"{mean_gap:+.6f} +/- {se:.6f} (se)")
-        print(f"            one-sample t = {t:.3f}, df = {df}, p = {p:.4g}")
-        print(f"            (raw -- subtract the shared arm's gap before quoting this; "
-              f"see ADJUSTED below)")
-    print(f"            mean capture = {mean_capture:.6f}, "
-          f"chance = {mean_chance:.6f}, ratio = {mean_capture / mean_chance:.3f}")
-
-    # relative gap: the gap as a fraction of the capture level, so runs with different
-    # r/d are comparable.
-    rel = mean_gap / mean_capture if mean_capture else float('nan')
-    print(f"            relative gap = {rel:+.2%} of mean capture")
+        m, se, t, df, p = res
+        row["fc_gap"], row["fc_se"], row["fc_p"] = m, se, p
+        print(f"  flipped - clean ({scope}) = {m:+.6f} +/- {se:.6f}, p = {p:.4g}"
+              f"   [needs the shared baseline]")
+    row["fc_gaps"] = fc_diffs
+    row["capture"] = mean(cap_all)
+    row["chance"] = mean(chance_all)
+    print(f"  mean capture = {row['capture']:.6f}, chance = {row['chance']:.6f}, "
+          f"ratio = {row['capture'] / row['chance']:.1f}x")
     print()
-    return {
-        "name": name, "path": path, "mean_gap": mean_gap, "se": se, "t": t, "df": df,
-        "p": p, "n_updates": len(gaps), "capture": mean_capture, "chance": mean_chance,
-        "rel": rel, "gaps": gaps, "mode": manifest.get("oracle_batch_mode", "?"),
-    }
+    return row
 
 
 def report_comparison(rows, alpha):
-    if len(rows) < 2:
+    if not rows:
         return
-    print("=" * 92)
+    print("=" * 100)
     print("COMPARISON")
     print()
-    print("Raw gaps (not yet baseline-adjusted):")
-    print()
-    print(f"{'run':>22} {'updates':>8} {'raw gap':>12} {'se':>10} {'p':>10} "
-          f"{'rel gap':>10} {'cap/chance':>11}")
-    print("-" * 88)
-    for r in rows:
-        ratio = r["capture"] / r["chance"] if r["chance"] else float('nan')
-        print(f"{r['name']:>22} {r['n_updates']:>8} {r['mean_gap']:>+12.6f} "
-              f"{r['se']:>10.6f} {r['p']:>10.4g} {r['rel']:>+10.2%} {ratio:>11.3f}")
-    print()
 
-    by_mode = {r["mode"]: r for r in rows}
-    placebo = by_mode.get("shared")
-
-    if placebo is None:
-        print("No 'shared' arm supplied, so the raw gaps above cannot be baseline-adjusted.")
-        print("A mislabeled example's gradient is unusual, and any subspace fitted to any")
-        print("natural batch captures unusual directions less well -- that offset is in every")
-        print("number above and it is not leakage. Re-run with --oracle_batch_mode shared to")
-        print("measure it. Until then, treat the table as uninterpreted.")
+    mem_rows = [r for r in rows if r["tagged"] and "mem_p" in r]
+    if mem_rows:
+        print("Membership test -- fed vs holdout, flipped canaries. Self-controlled; quote this one.")
         print()
-        return
+        print(f"{'run':>22} {'fed - holdout':>14} {'se':>10} {'p':>10}  verdict")
+        print("-" * 78)
+        verdicts = {}
+        for r in mem_rows:
+            p = r["mem_p"]
+            sig = p == p and p < alpha
+            verdict = "LEAK DETECTED" if (sig and r["mem_gap"] > 0) else "no detectable leak"
+            if sig and r["mem_gap"] < 0:
+                verdict = "negative (investigate)"
+            # Keyed by (method, mode): auditing galore and subtrack in one go gives two
+            # rows called 'skip', and a mode-only key would silently drop one of them.
+            verdicts[(r["method"], r["mode"])] = (r["mem_gap"], p, sig and r["mem_gap"] > 0)
+            print(f"{r['name']:>22} {r['mem_gap']:>+14.6f} {r.get('mem_se', float('nan')):>10.6f} "
+                  f"{p:>10.4g}  {verdict}")
+        print()
+    else:
+        verdicts = {}
+        print("No run had a dev-split subspace batch, so the membership test could not run.")
+        print("Use --oracle_batch_mode skip and/or private-skip.")
+        print()
 
-    print("ADJUSTED LEAKAGE   (gap minus the placebo's gap -- this is the estimate to quote)")
-    print()
-    print(f"  placebo (shared) geometry offset = {placebo['mean_gap']:+.6f} "
-          f"+/- {placebo['se']:.6f}")
-    print("  the subspace there is fitted to the TRAIN batch, so it cannot have seen these")
-    print("  dev canaries; whatever gap it shows is geometry, not leakage.")
-    print()
-    print(f"{'run':>22} {'adjusted gap':>14} {'se':>10} {'p':>10}  verdict")
-    print("-" * 78)
-
-    verdicts = {}
+    methods = []
     for r in rows:
-        if r["mode"] == "shared":
+        if r["method"] not in methods:
+            methods.append(r["method"])
+
+    for method in methods:
+        mine = [r for r in rows if r["method"] == method]
+        placebo = next((r for r in mine if r["mode"] == "shared"), None)
+        others = [r for r in mine if r["mode"] != "shared" and "fc_gap" in r]
+        if not others:
             continue
-        adj = r["mean_gap"] - placebo["mean_gap"]
-        # Independent runs, so the standard errors of the two per-step gap means add in
-        # quadrature; Welch on the two sets of per-step gaps gives the p-value.
-        w = welch(r["gaps"], placebo["gaps"])
-        if w is None:
-            print(f"{r['name']:>22} {adj:>+14.6f} {'--':>10} {'--':>10}  "
-                  f"too few updates to test")
-            continue
-        _, t, df, p = w
-        se = math.sqrt(r["se"] ** 2 + placebo["se"] ** 2)
-        sig = p < alpha
-        verdict = "LEAK DETECTED" if (sig and adj > 0) else "no detectable leak"
-        if sig and adj < 0:
-            verdict = "negative (investigate)"
-        verdicts[r["mode"]] = (adj, p, sig and adj > 0)
-        print(f"{r['name']:>22} {adj:>+14.6f} {se:>10.6f} {p:>10.4g}  {verdict}")
-    print()
+        print(f"Flipped vs clean, {method} (secondary; baseline-adjusted if a shared run exists)")
+        if placebo is None:
+            print("  no shared run for this method -- raw, and includes the geometry offset,")
+            print("  which is not leakage. Treat as uninterpreted.")
+            for r in others:
+                print(f"  {r['name']:>22} raw {r['fc_gap']:>+12.6f}  p = {r['fc_p']:.4g}")
+        else:
+            print(f"  shared geometry offset = {placebo['fc_gap']:+.6f}")
+            for r in others:
+                adj = r["fc_gap"] - placebo["fc_gap"]
+                w = welch(r["fc_gaps"], placebo["fc_gaps"])
+                p = w[3] if w else float('nan')
+                print(f"  {r['name']:>22} adjusted {adj:>+12.6f}  p = {p:.4g}")
+        print()
 
     print("Reading it")
-    print("-" * 92)
-    leaky = verdicts.get("skip")
-    fixed = verdicts.get("private-skip")
-    if leaky is not None and fixed is not None:
-        if leaky[2] and not fixed[2]:
-            print("  skip leaks, private-skip does not. Privatizing the subspace removed the")
-            print("  detectable per-record response -- the result the experiment is designed")
-            print("  to produce, and the empirical counterpart of eps = inf vs finite eps.")
-        elif leaky[2] and fixed[2]:
-            print("  Both leak. Check the private-skip mechanism is actually binding:")
-            print("  subspace/clipped_fraction in the training log should be ~1.0. If it is")
-            print("  well below, C_sub is too large, almost nothing is being clipped, and the")
-            print("  'privatized' gradient is close to the bare one.")
-        elif not leaky[2]:
-            print("  No leak detected even in skip. Either the probe is underpowered (raise")
-            print("  --num_canaries, or lower --subspace_T for more updates), or the subspace")
-            print("  is not tracking anything -- check cap/chance above and mean_rotation_deg")
-            print("  in the training log. A gap measured under a subspace that is not moving")
-            print("  is not evidence about a subspace that is.")
-    else:
-        missing = [m for m in ("skip", "private-skip") if m not in verdicts]
-        print(f"  Missing arm(s): {', '.join(missing)}. skip vs private-skip is the")
-        print("  comparison the experiment exists to make.")
+    print("-" * 100)
+    for method in methods:
+        leaky = verdicts.get((method, "skip"))
+        fixed = verdicts.get((method, "private-skip"))
+        if leaky is None and fixed is None:
+            continue
+        print(f"  [{method}]")
+        if leaky is not None and fixed is not None:
+            if leaky[2] and not fixed[2]:
+                print("    skip leaks, private-skip does not. Records that fed the bare subspace")
+                print("    are identifiable from it; once the subspace is a DP release they are")
+                print("    not. That is the empirical counterpart of eps = infinity vs finite eps.")
+            elif leaky[2] and fixed[2]:
+                print("    Both leak. Check the private-skip mechanism is actually binding:")
+                print("    subspace/clipped_fraction in the training log should be ~1.0. Well")
+                print("    below means C_sub is too large, almost nothing is clipped, and the")
+                print("    'privatized' gradient is close to the bare one.")
+            else:
+                print("    No leak detected even in skip. Before concluding anything, check:")
+                print("      - cap/chance above. Near 1.0 means the subspace is not tracking.")
+                print("      - mean_rotation_deg in the training log. The dptrack script targets")
+                print("        ~10 deg per update; 40+ means ST_STEP_SIZE is far too large and")
+                print("        the subspace is thrashing rather than accumulating.")
+                print("      - the fed/prior/holdout decay. If it is flat, one record out of a")
+                print("        64-batch simply does not move a rank-r subspace measurably at this")
+                print("        scale -- itself a reportable result, but say it that way.")
+        else:
+            missing = "private-skip" if fixed is None else "skip"
+            print(f"    Missing the {missing} arm; skip vs private-skip is the comparison.")
+
+    leak_sizes = {m: verdicts[(m, "skip")][0] for m in methods if (m, "skip") in verdicts}
+    if len(leak_sizes) > 1:
+        print()
+        print("  [across methods]")
+        ranked = sorted(leak_sizes.items(), key=lambda kv: -kv[1])
+        print("    skip-arm leak size: " +
+              ",  ".join(f"{m} {v:+.6f}" for m, v in ranked))
+        top, bottom = ranked[0], ranked[-1]
+        if bottom[1] > 0:
+            print(f"    {top[0]} leaks {top[1] / bottom[1]:.1f}x more than {bottom[0]}.")
+        else:
+            print(f"    {top[0]} leaks; {bottom[0]} does not measurably.")
+        print("    So how hard the tracker refits -- not just whether it is data-driven --")
+        print("    sets how much a data-dependent subspace gives away.")
     print()
 
 
@@ -327,9 +418,7 @@ def main():
     rows = []
     for path in args.logs:
         manifest, by_step = load(path)
-        row = report_run(path, manifest, by_step, verbose=not args.quiet)
-        if row is not None:
-            rows.append(row)
+        rows.append(report_run(path, manifest, by_step, verbose=not args.quiet))
     report_comparison(rows, args.alpha)
 
     if _scipy_stats is None:

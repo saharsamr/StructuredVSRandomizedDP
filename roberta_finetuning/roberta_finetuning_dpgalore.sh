@@ -124,4 +124,5 @@ TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$M
     --use_wandb $USE_WANDB \
     --report_to none \
     --log_file $OUT_FILE \
-    --no_train False
+    --no_train False \
+    "$@"

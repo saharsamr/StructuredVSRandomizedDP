@@ -17,7 +17,12 @@ from torch import nn
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data.sampler import RandomSampler, SequentialSampler
+from torch.utils.data.sampler import (
+    BatchSampler,
+    RandomSampler,
+    SequentialSampler,
+    SubsetRandomSampler,
+)
 from torch.optim.lr_scheduler import LambdaLR
 import math
 import time
@@ -53,7 +58,7 @@ import torch.nn.functional as F
 
 from .linearhead_trainer import LinearHeadTrainer
 from . import wandb_utils
-from .canary import CanaryProbe
+from .canary import CanaryProbe, RecordingBatchSampler
 from transformers.trainer_callback import TrainerState
 
 import copy
@@ -169,6 +174,12 @@ class Trainer(LinearHeadTrainer):
     # Set by roberta_finetuning_run.py when --canary_probe is on. Scored after every
     # subspace update; see roberta_utils/canary.py for what it measures.
     canary_probe = None
+    # Set alongside subspace_dataloader for the dev-split modes; None under 'shared',
+    # where the subspace comes from the training batch and there is no dev draw to record.
+    subspace_batch_sampler = None
+    # Size of the pool the subspace samples from -- len(dev) normally, less when the canary
+    # probe fences off a holdout. Drives the private-skip sampling rate.
+    subspace_pool_size = None
 
     @property
     def low_rank_method(self):
@@ -613,15 +624,38 @@ class Trainer(LinearHeadTrainer):
                     # disjointness -- see setup_private_subspace_mechanism.
                     assert self.eval_dataset is not None, \
                         f'--oracle_batch_mode {self.args.oracle_batch_mode} requires --do_eval'
+                    # An explicit BatchSampler, not batch_size + sampler: DataLoader builds
+                    # exactly this internally, so the draw is unchanged and the accountant's
+                    # fixed batch size still holds, but wrapping it lets the canary probe
+                    # read which dev examples fed each subspace update.
+                    #
+                    # With the probe on, the base sampler is restricted to the probe's pool,
+                    # fencing the holdout canaries out of every subspace batch. That is what
+                    # makes them a control the sampler cannot exhaust. self.subspace_pool_size
+                    # carries the reduced size to the accountant.
+                    if self.canary_probe is not None:
+                        base_sampler = SubsetRandomSampler(
+                            self.canary_probe.subspace_pool_indices
+                        )
+                        self.subspace_pool_size = len(self.canary_probe.subspace_pool_indices)
+                    else:
+                        base_sampler = RandomSampler(self.eval_dataset)
+                        self.subspace_pool_size = len(self.eval_dataset)
+                    self.subspace_batch_sampler = RecordingBatchSampler(
+                        BatchSampler(
+                            base_sampler,
+                            batch_size=self.args.train_batch_size,
+                            # drop_last keeps the batch size fixed, which the accountant assumes.
+                            drop_last=True,
+                        )
+                    )
                     self.subspace_dataloader = DataLoader(
                         self.eval_dataset,
-                        batch_size=self.args.train_batch_size,
-                        sampler=RandomSampler(self.eval_dataset),
+                        batch_sampler=self.subspace_batch_sampler,
                         collate_fn=self.data_collator,
-                        # drop_last keeps the batch size fixed, which the accountant assumes.
-                        drop_last=True,
                     )
                 else:
+                    self.subspace_batch_sampler = None
                     self.subspace_dataloader = train_dataloader
                 self.subspace_iter = None
                 self.subspace_batches_consumed = 0
@@ -1028,11 +1062,16 @@ class Trainer(LinearHeadTrainer):
         if not projected_params:
             raise RuntimeError("private-skip found no projected parameters to privatize")
 
-        num_dev = len(self.eval_dataset)
+        # The pool the subspace actually samples from, which --canary_probe shrinks by
+        # fencing off its holdout. The sampling rate -- and so the noise -- must follow the
+        # pool, not len(dev): a smaller pool means each record is drawn more often.
+        num_dev = getattr(self, "subspace_pool_size", None) or len(self.eval_dataset)
         batch_size = self.args.train_batch_size
         if batch_size > num_dev:
             raise ValueError(
-                f"subspace batch size {batch_size} exceeds the dev split ({num_dev} examples)"
+                f"subspace batch size {batch_size} exceeds the pool the subspace samples "
+                f"from ({num_dev} examples). With --canary_probe the pool is the dev split "
+                f"minus the holdout; lower --canary_holdout_frac or the batch size"
             )
 
         # Trigger is `global_step % subspace_T == 0`, so updates land on 0, T, 2T, ...
@@ -1178,9 +1217,16 @@ class Trainer(LinearHeadTrainer):
             # Score the dev canaries against the subspace this batch just produced. Inside
             # the try so it still runs with hooks disabled (it needs a plain p.grad, not a
             # per-sample one) and outside the no_grad block because it backwards.
+            #
+            # last_batch is the draw that produced the gradient a few lines above -- with
+            # num_workers=0 the loader fetches synchronously, so it has not run ahead.
             if self.canary_probe is not None:
                 canary_summary = self.canary_probe.measure(
-                    self, model, optimizer, self.state.global_step
+                    self, model, optimizer, self.state.global_step,
+                    batch_indices=(
+                        self.subspace_batch_sampler.last_batch
+                        if self.subspace_batch_sampler is not None else None
+                    ),
                 )
         finally:
             grads = None

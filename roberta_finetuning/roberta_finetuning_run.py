@@ -592,6 +592,15 @@ class DynamicTrainingArguments(TrainingArguments):
         default=0,
         metadata={"help": "picks which dev examples are canaries and which half gets flipped"}
     )
+    canary_holdout_frac: float = field(
+        default=0.25,
+        metadata={
+            "help": "fraction of the dev split fenced off from every subspace batch, as the "
+                    "permanent control group. Without it the control is 'not drawn yet', "
+                    "which runs out after |dev|/batch_size updates (16 at 1024/64). Shrinks "
+                    "the pool the subspace samples from, which the private-skip accountant "
+                    "follows"}
+    )
     canary_log: str = field(
         default='',
         metadata={"help": "JSONL output path for the probe; empty writes "
@@ -1038,6 +1047,7 @@ def main():
             dataset=eval_dataset,
             num_canaries=training_args.num_canaries,
             seed=training_args.canary_seed,
+            holdout_frac=training_args.canary_holdout_frac,
             log_path=canary_log,
         )
         trainer.canary_probe.start_log(extra={
@@ -1049,6 +1059,8 @@ def main():
             'max_steps': training_args.max_steps,
             'dp_epsilon': training_args.dp_epsilon,
             'dp_clip_threshold': training_args.dp_clip_threshold,
+            'st_step_size': training_args.st_step_size,
+            'subspace_batch_size': training_args.train_batch_size,
             'seed': training_args.seed,
         })
 

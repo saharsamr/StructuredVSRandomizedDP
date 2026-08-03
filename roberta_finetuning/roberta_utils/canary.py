@@ -59,6 +59,31 @@ from dpgrape.low_rank_projector_dp import iter_low_rank_projectors
 logger = logging.get_logger(__name__)
 
 
+class RecordingBatchSampler:
+    """A BatchSampler that remembers the indices of the batch it last handed out.
+
+    DataLoader(dataset, batch_size=B, sampler=S, drop_last=True) builds exactly
+    ``BatchSampler(S, B, drop_last=True)`` internally, so passing one of these as
+    ``batch_sampler`` samples identically -- it just makes the draw observable, which is
+    what lets the probe tell which canaries fed the subspace at each update.
+
+    Only valid with num_workers=0. With workers the loader prefetches, so ``last_batch``
+    would run ahead of the batch the caller is holding.
+    """
+
+    def __init__(self, base):
+        self.base = base
+        self.last_batch = None
+
+    def __iter__(self):
+        for batch in self.base:
+            self.last_batch = list(batch)
+            yield batch
+
+    def __len__(self):
+        return len(self.base)
+
+
 class Canary:
     """One dev example under test.
 
@@ -68,15 +93,21 @@ class Canary:
             With num_sample > 1 one query example expands into several features (different
             demonstration draws / templates); all of them get the flipped label, and this
             is the first, which is the one we measure.
+        feature_positions: every position in ``dataset.features`` belonging to this query
+            example. The canary counts as having fed a subspace batch if *any* of them was
+            drawn, which is why the whole list is kept and not just feature_idx.
         flipped: True if this canary's label was changed.
         true_label / used_label: equal unless flipped.
     """
 
-    __slots__ = ("query_idx", "feature_idx", "flipped", "true_label", "used_label")
+    __slots__ = ("query_idx", "feature_idx", "feature_positions", "flipped",
+                 "true_label", "used_label")
 
-    def __init__(self, query_idx, feature_idx, flipped, true_label, used_label):
+    def __init__(self, query_idx, feature_idx, feature_positions, flipped,
+                 true_label, used_label):
         self.query_idx = query_idx
         self.feature_idx = feature_idx
+        self.feature_positions = tuple(feature_positions)
         self.flipped = flipped
         self.true_label = true_label
         self.used_label = used_label
@@ -104,14 +135,30 @@ class CanaryProbe:
             which is usually what you want: the dev split in a k-shot run is small, and
             every example in it feeds the subspace anyway.
         seed: controls both which examples are chosen and which half gets flipped.
+        holdout_frac: fraction of the dev split fenced off from the subspace batches
+            entirely. These are the permanent control group -- records the subspace
+            provably never touched, at any update.
+
+            Without a holdout the control is 'not drawn yet', which the sampler exhausts:
+            a dev split of D with batch B has only D/B batches in an epoch, so after that
+            many subspace updates every example has fed the subspace and the comparison
+            has no control group left. At D=1024, B=64 that is 16 updates. Fencing off a
+            fraction removes the ceiling and makes the control strictly cleaner.
+
+            It also shrinks the pool the subspace samples from, which raises the
+            private-skip sampling rate; the trainer accounts for that by passing the pool
+            size, not len(dev), to the accountant.
         log_path: JSONL output. Line 1 is the manifest, one line per (step, canary) after.
     """
 
-    def __init__(self, dataset, num_canaries=-1, seed=0, log_path=None):
+    def __init__(self, dataset, num_canaries=-1, seed=0, holdout_frac=0.25, log_path=None):
         self.dataset = dataset
         self.seed = seed
+        self.holdout_frac = holdout_frac
         self.log_path = log_path
         self._log_started = False
+        if not 0.0 <= holdout_frac < 1.0:
+            raise ValueError(f"holdout_frac must be in [0, 1), got {holdout_frac}")
 
         if dataset.features is None:
             raise ValueError(
@@ -166,17 +213,50 @@ class CanaryProbe:
             else:
                 used_label = true_label
             self.canaries.append(
-                Canary(query_idx, feat_positions[0], flipped, int(true_label), int(used_label))
+                Canary(query_idx, feat_positions[0], feat_positions, flipped,
+                       int(true_label), int(used_label))
             )
+
+        # feature position -> position in self.canaries, so a drawn subspace batch (which
+        # is a list of feature indices) can be turned into the set of canaries that fed it.
+        self._feat_to_canary = {}
+        for i, canary in enumerate(self.canaries):
+            for feat_idx in canary.feature_positions:
+                self._feat_to_canary[feat_idx] = i
 
         self.num_flipped = sum(c.flipped for c in self.canaries)
         self.num_clean = len(self.canaries) - self.num_flipped
+
+        # The permanent holdout. Split by canary rather than by raw feature index so a
+        # canary is either wholly eligible or wholly fenced off -- one with some features
+        # drawable and some not would be neither fed nor unseen. Drawn separately from the
+        # flipped and clean lists so both the pool and the holdout stay label-balanced.
+        num_held = int(round(self.holdout_frac * len(self.canaries)))
+        held_order = torch.randperm(len(self.canaries), generator=gen).tolist()
+        flipped_ids = [i for i in held_order if self.canaries[i].flipped]
+        clean_ids = [i for i in held_order if not self.canaries[i].flipped]
+        self.holdout_canaries = set(
+            flipped_ids[:num_held // 2] + clean_ids[:num_held - num_held // 2]
+        )
+        held_features = set()
+        for i in self.holdout_canaries:
+            held_features.update(self.canaries[i].feature_positions)
+        # Feature indices the subspace sampler is allowed to draw. Everything not fenced
+        # off, including any dev example that was not selected as a canary.
+        self.subspace_pool_indices = [
+            i for i in range(len(dataset.features)) if i not in held_features
+        ]
+
         logger.warning(
             "*** canary probe: %d dev examples under test, %d with flipped labels. "
+            "%d are held out of the subspace batches entirely (the permanent control); "
+            "the subspace samples from the remaining %d feature rows. "
             "The dev split now contains deliberately wrong labels, so eval metrics from "
             "this run are NOT meaningful -- do not use them for model selection or to "
             "report accuracy. The output of this run is %s. ***",
-            len(self.canaries), self.num_flipped, log_path or "the in-log canary summary",
+            len(self.canaries), self.num_flipped, len(self.holdout_canaries),
+            len(self.subspace_pool_indices),
+            log_path or "the in-log canary summary",
         )
 
     # ------------------------------------------------------------------ measurement
@@ -207,7 +287,7 @@ class CanaryProbe:
             chance += (projector.rank / d) * energy
         return captured, total, chance
 
-    def measure(self, trainer, model, optimizer, global_step):
+    def measure(self, trainer, model, optimizer, global_step, batch_indices=None):
         """One backward per canary; log its capture against the subspace just built.
 
         Call from inside ``update_low_rank_subspaces``' hooks-disabled region, after the
@@ -215,14 +295,30 @@ class CanaryProbe:
         subspace that this step's batch produced.
 
         The model is put in eval mode for the duration so dropout does not randomize the
-        gradient; the flipped-vs-clean difference we are chasing is small enough that
-        dropout noise would need many more canaries to see through.
+        gradient; the differences we are chasing are small enough that dropout noise would
+        need many more canaries to see through.
+
+        Args:
+            batch_indices: the feature indices that went into *this* update's subspace
+                batch, from RecordingBatchSampler.last_batch. Each record is then tagged
+                with in_batch, which is what lets the analysis compare the canaries that
+                fed this subspace against the ones that have not fed it yet -- both groups
+                being a random split of the same population, so nothing has to be
+                subtracted off. None (shared mode, where the subspace comes from the train
+                batch) leaves the tag off and only the flipped/clean split is available.
         """
+        fed_this_update = None
+        if batch_indices is not None:
+            fed_this_update = {
+                self._feat_to_canary[i] for i in batch_indices
+                if i in self._feat_to_canary
+            }
+
         was_training = model.training
         model.eval()
         records = []
         try:
-            for canary in self.canaries:
+            for canary_pos, canary in enumerate(self.canaries):
                 feature = self.dataset[canary.feature_idx]
                 batch = trainer.data_collator([feature])
                 batch = trainer._prepare_inputs(batch)
@@ -239,7 +335,7 @@ class CanaryProbe:
 
                 if total == 0.0:
                     continue
-                records.append({
+                record = {
                     "step": global_step,
                     "query_idx": canary.query_idx,
                     "flipped": canary.flipped,
@@ -247,7 +343,11 @@ class CanaryProbe:
                     "chance": chance / total,
                     "grad_sq_norm": total,
                     "loss": float(loss.detach().item()),
-                })
+                }
+                if fed_this_update is not None:
+                    record["in_batch"] = canary_pos in fed_this_update
+                    record["held_out"] = canary_pos in self.holdout_canaries
+                records.append(record)
         finally:
             optimizer.zero_grad()
             if was_training:
@@ -258,21 +358,35 @@ class CanaryProbe:
 
     @staticmethod
     def _summarize(records, global_step):
-        """Means per group and the gap, for the training log / wandb."""
+        """Group means for the training log / wandb.
+
+        The in_batch split is the one to watch: canaries that fed this update's subspace
+        against those that did not. Everything else is secondary.
+        """
+        def mean(xs):
+            return sum(xs) / len(xs) if xs else None
+
+        summary = {"canary_step": global_step, "canary_n": len(records)}
+        summary["canary_capture_chance"] = mean([r["chance"] for r in records])
+
         flip = [r["capture"] for r in records if r["flipped"]]
         clean = [r["capture"] for r in records if not r["flipped"]]
-        chance = [r["chance"] for r in records]
-        summary = {"canary_step": global_step, "canary_n": len(records)}
-        if flip:
-            summary["canary_capture_flipped"] = sum(flip) / len(flip)
-        if clean:
-            summary["canary_capture_clean"] = sum(clean) / len(clean)
+        summary["canary_capture_flipped"] = mean(flip)
+        summary["canary_capture_clean"] = mean(clean)
         if flip and clean:
-            summary["canary_capture_gap"] = (
-                summary["canary_capture_flipped"] - summary["canary_capture_clean"]
-            )
-        if chance:
-            summary["canary_capture_chance"] = sum(chance) / len(chance)
+            summary["canary_capture_gap"] = mean(flip) - mean(clean)
+
+        tagged = [r for r in records if "in_batch" in r]
+        if tagged:
+            fed = [r["capture"] for r in tagged if r["in_batch"] and r["flipped"]]
+            held = [r["capture"] for r in tagged if r["held_out"] and r["flipped"]]
+            summary["canary_n_in_batch"] = sum(1 for r in tagged if r["in_batch"])
+            summary["canary_capture_fed"] = mean(fed)
+            summary["canary_capture_holdout"] = mean(held)
+            if fed and held:
+                # The headline number: same records, same flipped labels, split only by
+                # whether they were ever allowed to reach the subspace.
+                summary["canary_membership_gap"] = mean(fed) - mean(held)
         return summary
 
     # ------------------------------------------------------------------------- log
@@ -287,6 +401,9 @@ class CanaryProbe:
             "num_flipped": self.num_flipped,
             "num_clean": self.num_clean,
             "num_labels": self.num_labels,
+            "holdout_frac": self.holdout_frac,
+            "num_holdout": len(self.holdout_canaries),
+            "subspace_pool_size": len(self.subspace_pool_indices),
             "canaries": [c.as_dict() for c in self.canaries],
         }
         if extra:
