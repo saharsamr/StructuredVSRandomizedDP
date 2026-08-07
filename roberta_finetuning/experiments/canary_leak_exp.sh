@@ -33,13 +33,26 @@
 #
 # Usage:  bash experiments/canary_leak_exp.sh                  # from roberta_finetuning/
 #         METHOD=subtrack bash experiments/canary_leak_exp.sh   # DPTrack instead of GaLore
-#         TASK=RTE NUM_CANARIES=256 bash experiments/canary_leak_exp.sh
+#         TASK=SST-2 NUM_CANARIES=256 bash experiments/canary_leak_exp.sh
 #         MODES="skip private-skip" bash experiments/canary_leak_exp.sh
 #         ANALYZE_ONLY=true bash experiments/canary_leak_exp.sh   # re-print from old logs
 
 set -u
 
-TASK=${TASK:-SST-2}
+# RTE. The dev split it produces is the same size as SST-2's (RTE's original train has 2490
+# examples, 1249/1241 per class, so K=512 fills both train.tsv and dev.tsv with 512 per class
+# = 1024 each) -- so every count below, the sampling rate, and the accountant's sigma are
+# unchanged from the SST-2 version of this experiment. What does change is sequence length:
+# roberta_finetuning_fewshot.sh gives RTE --max_seq_len 256 against SST-2's 128, and RTE is a
+# sentence-pair task, so both training and the probe's per-canary backwards cost roughly 2x.
+#
+# If that OOMs, the knob is PER_DEVICE_TRAIN_BS, and lowering it is not free: the subspace
+# batch sampler uses args.train_batch_size (per-device x n_gpu, NOT multiplied by gradient
+# accumulation), so GRAD_ACCUM_STEPS cannot buy the memory back without shrinking the
+# subspace batch. A smaller batch changes the sampling rate, hence sigma and the 1-in-12
+# dilution the membership test rests on. All six arms would still share it, so the
+# comparison stays internally valid -- but it is no longer the SST-2 configuration.
+TASK=${TASK:-RTE}
 K=${K:-512}
 SEED=${SEED:-42}
 STEP=${STEP:-1000}
@@ -78,13 +91,18 @@ SUBSPACE_T=${SUBSPACE_T:-25}
 # 10 -> 2 should land near 9-10 deg. CHECK mean_rotation_deg in the training log and
 # rescale linearly if it is off; a leak measured on a thrashing subspace says nothing about
 # a properly tuned one.
+#
+# That 2 was calibrated on SST-2. Rotation per update depends on the gradient scale, which
+# is task-dependent, so on RTE this is a starting point and not a tuned value: read
+# mean_rotation_deg out of the first subtrack run and rescale before trusting the number.
 ST_STEP_SIZE=${ST_STEP_SIZE:-2}
 
 # How many dev examples go under test. Every canary costs one extra single-example backward
-# per subspace update: NUM_CANARIES * (STEP/SUBSPACE_T + 1) in total. At -1 on SST-2 that is
-# 1024 * 41 = 42k backwards, which the first run clocked at ~35 s per update, so ~25 min of
-# probe time per arm on top of training. Halve it if that is too slow -- the per-step groups
-# shrink proportionally, but the test statistic is per-update, so power drops slowly.
+# per subspace update: NUM_CANARIES * (STEP/SUBSPACE_T + 1) in total. At -1 on RTE that is
+# 1024 * 41 = 42k backwards, the same count as SST-2 -- but at 256 tokens instead of 128, so
+# budget roughly twice the ~35 s per update the SST-2 run clocked, i.e. ~50 min of probe time
+# per arm on top of training. Halve it if that is too slow -- the per-step groups shrink
+# proportionally, but the test statistic is per-update, so power drops slowly.
 NUM_CANARIES=${NUM_CANARIES:--1}
 CANARY_SEED=${CANARY_SEED:-0}
 
@@ -114,6 +132,34 @@ UPDATES=$((STEP / SUBSPACE_T + 1))
 
 RUN_ROOT=${RUN_ROOT:-canary_logs/${TASK}-k${K}-seed${SEED}-r${SUBSPACE_R}-T${SUBSPACE_T}-eps${PRIVACY_EPS}-cseed${CANARY_SEED}}
 
+# Fail here rather than several hours in. The k-shot splits are what the whole design rests
+# on -- the canaries live in dev.tsv and the accountant's sampling rate is batch/|pool| --
+# so check they exist and report the size that everything downstream is derived from.
+DATA_DIR=data/k-shot-1k-test/$TASK/$K-$SEED
+DEV_SIZE=""
+if [ "$ANALYZE_ONLY" != "true" ]; then
+    if [ ! -d "$DATA_DIR" ]; then
+        echo "no k-shot data at $DATA_DIR." >&2
+        echo "Run data/prepare_datasets.sh from roberta_finetuning/ -- it builds every task" >&2
+        echo "at K=16 and K=512 for seeds 13/21/42/87/100, $TASK included." >&2
+        exit 1
+    fi
+    # MNLI names it dev_matched.tsv; the non-GLUE tasks (trec, sst-5, ...) use .csv, which has
+    # no header row. Everything else is a .tsv whose first line is the header.
+    for CAND in dev.tsv dev_matched.tsv dev.csv; do
+        if [ -f "$DATA_DIR/$CAND" ]; then
+            DEV_SIZE=$(wc -l < "$DATA_DIR/$CAND")
+            case $CAND in *.tsv) DEV_SIZE=$((DEV_SIZE - 1)) ;; esac
+            break
+        fi
+    done
+    if [ -z "$DEV_SIZE" ]; then
+        echo "$DATA_DIR exists but has no dev split -- regenerate it with" >&2
+        echo "roberta_utils/tools/generate_k_shot_data.py --mode k-shot-1k-test --k $K" >&2
+        exit 1
+    fi
+fi
+
 echo "=========================================================================="
 echo "Canary leak experiment"
 echo "  methods         $METHODS"
@@ -124,6 +170,17 @@ echo "  steps           $STEP,  subspace r=$SUBSPACE_R, T=$SUBSPACE_T"
 echo "                  -> $UPDATES subspace updates per run = the sample size"
 echo "  epsilon         $PRIVACY_EPS,  st_step_size $ST_STEP_SIZE (subtrack only)"
 echo "  canaries        $NUM_CANARIES (half flipped), holdout $CANARY_HOLDOUT_FRAC, seed $CANARY_SEED"
+if [ -n "$DEV_SIZE" ]; then
+    # What the probe will actually do with that dev split. n_canaries = the whole split at
+    # -1; the holdout is fenced out of every subspace batch, so the sampler draws from the
+    # rest, and that reduced pool is also the denominator of the private-skip sampling rate.
+    N_CAN=$NUM_CANARIES
+    [ "$N_CAN" -lt 0 ] && N_CAN=$DEV_SIZE
+    N_HELD=$(awk "BEGIN{printf \"%d\", int($CANARY_HOLDOUT_FRAC * $N_CAN + 0.5)}")
+    BATCH=${PER_DEVICE_TRAIN_BS:-64}
+    echo "  dev split       $DEV_SIZE examples -> $N_CAN canaries, $N_HELD held out,"
+    echo "                  pool $((DEV_SIZE - N_HELD)) drawn $BATCH at a time by the subspace batch"
+fi
 echo "  logs            $RUN_ROOT"
 echo "--------------------------------------------------------------------------"
 echo "  This is a long job. To cut it down:"
